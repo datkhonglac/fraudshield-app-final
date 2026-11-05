@@ -1,0 +1,54 @@
+﻿field_order,file_name,field_name,data_type,nullable,description,allowed_values_or_format,example_value,usage_note
+1,transactions.csv,transaction_id,string,NO,Mã định danh duy nhất của giao dịch.,TXN000001…,TXN000001,Khóa chính của giao dịch; dùng để join với fraud_labels_sample.csv.
+2,transactions.csv,customer_id,string,NO,Mã khách hàng thực hiện giao dịch.,CUST0001…CUST0400,CUST0204,Join với customers.csv.
+3,transactions.csv,merchant_id,string,NO,Mã đơn vị chấp nhận thanh toán/merchant.,MER001…MER150,MER072,Join với merchants.csv.
+4,transactions.csv,datetime,datetime,NO,Thời điểm phát sinh giao dịch.,YYYY-MM-DD HH:MM:SS,2026-01-01 00:22:24,"Dùng để xây feature theo thời gian, velocity và chuỗi sự kiện."
+5,transactions.csv,amount,integer,NO,Số tiền giao dịch.,> 0,1115000,Đơn vị tiền tệ xác định bởi trường currency.
+6,transactions.csv,currency,string,NO,Loại tiền của giao dịch.,VND,VND,Bộ dữ liệu hiện tại sử dụng VND.
+7,transactions.csv,payment_channel,category,NO,Kênh thực hiện thanh toán.,CARD; BANK_TRANSFER; E_WALLET; QR; MOBILE_BANKING,CARD,Có thể mã hóa categorical khi xây mô hình.
+8,transactions.csv,device_id,string,NO,Mã thiết bị ghi nhận tại giao dịch.,DEV0001…,DEV0260,Join với devices.csv.
+9,transactions.csv,location,category,NO,Địa điểm giao dịch được mô phỏng ở mức tỉnh/thành phố.,Hanoi; Ho Chi Minh City; Da Nang; Hai Phong; Can Tho; Bac Ninh; Hung Yen; Quang Ninh; Thanh Hoa; Nghe An,Thanh Hoa,Có thể so sánh với home_location của khách hàng.
+10,transactions.csv,transaction_status,category,NO,Trạng thái xử lý giao dịch.,SUCCESS; FAILED; DECLINED,SUCCESS,Chuỗi thất bại/declined trước khi thành công có thể là tín hiệu rủi ro.
+11,transactions.csv,ip_country,category,NO,Quốc gia suy ra từ địa chỉ IP giao dịch.,VN; SG; TH; US; MY; JP; KR,VN,Không đồng nghĩa với gian lận; chỉ là tín hiệu ngữ cảnh.
+12,transactions.csv,is_card_present,boolean,NO,Cho biết giao dịch thẻ có hiện diện thẻ vật lý hay không.,TRUE; FALSE,TRUE,Có ý nghĩa chủ yếu với kênh CARD.
+13,transactions.csv,authentication_method,category,NO,Phương thức xác thực giao dịch.,PIN; OTP; BIOMETRIC; NONE,PIN,Có thể sử dụng làm feature rủi ro.
+14,customers.csv,customer_id,string,NO,Mã định danh duy nhất của khách hàng.,CUST0001…CUST0400,CUST0001,Khóa chính; join với transactions.csv.
+15,customers.csv,customer_segment,category,NO,Phân khúc khách hàng giả lập.,STUDENT; YOUNG_PROFESSIONAL; MASS; AFFLUENT; SME_OWNER,AFFLUENT,"Dùng làm ngữ cảnh hành vi, không phải nhãn gian lận."
+16,customers.csv,home_location,category,NO,Địa bàn cư trú/giao dịch nền của khách hàng.,Danh sách tỉnh/thành phố trong Data Pack,Hanoi,Có thể so sánh với location của giao dịch.
+17,customers.csv,account_open_date,date,NO,Ngày mở tài khoản giả lập.,YYYY-MM-DD,2021-11-22,Dùng để suy ra tuổi tài khoản.
+18,customers.csv,account_age_days,integer,NO,Số ngày tài khoản đã hoạt động tại mốc dữ liệu.,> 0,1682,Biến hồ sơ nền.
+19,customers.csv,avg_monthly_txn,decimal,NO,Số giao dịch trung bình mỗi tháng trong giai đoạn mô phỏng.,>= 0,4.2,"Thống kê hồ sơ, không phải ground truth."
+20,customers.csv,avg_transaction_amount,integer,NO,Mức giá trị giao dịch nền điển hình của khách hàng.,> 0,1828000,Có thể dùng để đo độ lệch amount của giao dịch.
+21,customers.csv,preferred_channel,category,NO,Kênh thanh toán thường dùng của khách hàng.,CARD; BANK_TRANSFER; E_WALLET; QR; MOBILE_BANKING,BANK_TRANSFER,Không bắt buộc giao dịch phải đi qua kênh này.
+22,customers.csv,registered_device_count,integer,NO,Số thiết bị chính thức gắn với hồ sơ khách hàng.,>= 1,2,Hỗ trợ nhận diện thiết bị mới.
+23,customers.csv,kyc_level,category,NO,Mức KYC giả lập của khách hàng.,STANDARD; ENHANCED,ENHANCED,Không phải nhãn gian lận.
+24,customers.csv,customer_status,category,NO,Trạng thái hồ sơ khách hàng.,ACTIVE; REVIEW,ACTIVE,"REVIEW chỉ là trạng thái nghiệp vụ, không đồng nghĩa fraud."
+25,merchants.csv,merchant_id,string,NO,Mã định danh duy nhất của merchant.,MER001…MER150,MER001,Khóa chính; join với transactions.csv.
+26,merchants.csv,merchant_name,string,NO,Tên merchant giả lập.,NOVA-MERCHANT-001…,NOVA-MERCHANT-001,Không đại diện doanh nghiệp thực tế.
+27,merchants.csv,merchant_category,category,NO,Nhóm ngành/loại hình merchant.,GROCERY; DINING; FASHION; ELECTRONICS; TRAVEL; HOTEL; EDUCATION; HEALTHCARE; FUEL; ENTERTAINMENT; ONLINE_MARKETPLACE; DIGITAL_SERVICE; MONEY_TRANSFER; GAMING; OTHER,FASHION,Có thể dùng làm feature theo ngành.
+28,merchants.csv,mcc,string,NO,Mã Merchant Category Code giả lập.,4 chữ số,5651,MCC được ánh xạ theo merchant_category.
+29,merchants.csv,merchant_location,category,NO,Địa bàn hoạt động chính của merchant.,Danh sách tỉnh/thành phố trong Data Pack,Hanoi,Không bắt buộc mọi giao dịch phải ở đúng địa bàn này.
+30,merchants.csv,merchant_risk_level,category,NO,Mức rủi ro nền của merchant.,LOW; MEDIUM; HIGH,LOW,"Là metadata rủi ro, không phải nhãn fraud của từng giao dịch."
+31,merchants.csv,is_cross_border,boolean,NO,Merchant có đặc tính hoạt động xuyên biên giới hay không.,TRUE; FALSE,FALSE,Không đồng nghĩa với giao dịch gian lận.
+32,merchants.csv,onboarding_date,date,NO,Ngày merchant được đưa vào hệ thống giả lập.,YYYY-MM-DD,2016-12-14,Dùng để suy ra tuổi quan hệ merchant.
+33,merchants.csv,merchant_age_days,integer,NO,Số ngày merchant đã tồn tại trong hệ thống tại mốc dữ liệu.,> 0,3486,Biến hồ sơ nền.
+34,merchants.csv,accepted_channels,string_list,NO,Các kênh thanh toán merchant thường chấp nhận.,Danh sách phân tách bằng dấu ;,CARD;QR;E_WALLET,Ví dụ CARD;QR;E_WALLET.
+35,merchants.csv,merchant_status,category,NO,Trạng thái nghiệp vụ của merchant.,ACTIVE; REVIEW,ACTIVE,REVIEW không đồng nghĩa fraud.
+36,devices.csv,device_id,string,NO,Mã định danh duy nhất của thiết bị.,DEV0001…,DEV0001,Khóa chính; join với transactions.csv.
+37,devices.csv,device_type,category,NO,Loại thiết bị.,ANDROID_PHONE; IOS_PHONE; TABLET; WEB_BROWSER; POS_TERMINAL,POS_TERMINAL,Dùng làm feature ngữ cảnh.
+38,devices.csv,os,category,NO,Hệ điều hành/môi trường thiết bị giả lập.,Android; iOS; iPadOS; Windows; macOS; Linux; EmbeddedOS,EmbeddedOS 4,Giá trị cụ thể có kèm phiên bản.
+39,devices.csv,first_seen_date,date,NO,Ngày thiết bị lần đầu được ghi nhận.,YYYY-MM-DD,2024-03-01,Có thể so sánh với datetime để nhận diện thiết bị mới.
+40,devices.csv,registered_customer_id,string,YES,Khách hàng chính thức được gắn với thiết bị.,CUSTxxxx hoặc để trống,CUST0001,Để trống nghĩa là thiết bị chưa được đăng ký với khách hàng trong hồ sơ nền.
+41,devices.csv,primary_observed_customer_id,string,NO,Khách hàng sử dụng thiết bị nhiều nhất trong dữ liệu quan sát.,CUSTxxxx,CUST0001,Thống kê quan sát; không phải quan hệ đăng ký chính thức.
+42,devices.csv,primary_location,category,NO,Địa điểm xuất hiện phổ biến nhất của thiết bị.,Danh sách tỉnh/thành phố trong Data Pack,Hanoi,Feature ngữ cảnh.
+43,devices.csv,device_risk_level,category,NO,Mức rủi ro nền của thiết bị.,LOW; MEDIUM; HIGH,LOW,Không phải nhãn fraud của giao dịch.
+44,devices.csv,rooted_or_jailbroken,boolean,NO,Cờ mô phỏng thiết bị root/jailbreak.,TRUE; FALSE,FALSE,"Tín hiệu rủi ro, không phải kết luận gian lận."
+45,devices.csv,emulator_flag,boolean,NO,Cờ cho biết thiết bị có dấu hiệu chạy giả lập.,TRUE; FALSE,FALSE,"Tín hiệu rủi ro, không phải kết luận gian lận."
+46,devices.csv,observed_customer_count,integer,NO,Số khách hàng đã được quan sát sử dụng thiết bị.,>= 1,1,Thiết bị dùng bởi nhiều khách hàng có thể đáng chú ý.
+47,devices.csv,transaction_count,integer,NO,Số giao dịch trong transactions.csv có sử dụng thiết bị.,>= 1,11,Thống kê mô tả.
+48,devices.csv,last_seen_date,date,NO,Ngày cuối thiết bị xuất hiện trong giai đoạn dữ liệu.,YYYY-MM-DD,2026-06-10,Thống kê mô tả.
+49,devices.csv,device_status,category,NO,Trạng thái nghiệp vụ của thiết bị.,ACTIVE; REVIEW; BLOCKED,ACTIVE,BLOCKED/REVIEW không đồng nghĩa nhãn fraud ở mọi giao dịch.
+50,fraud_labels_sample.csv,transaction_id,string,NO,Mã giao dịch được công khai nhãn.,TXNxxxxxx,TXN000006,Join với transactions.csv. Chỉ một phần giao dịch có nhãn công khai.
+51,fraud_labels_sample.csv,is_fraud,integer,NO,Nhãn nhị phân tham chiếu của giao dịch trong tập sample.,0 = normal; 1 = fraud/anomaly được cài,0,Dùng để train/validate; không có nhãn này cho toàn bộ corpus công khai.
+52,fraud_labels_sample.csv,fraud_type,category,YES,Loại mẫu bất thường/gian lận được cài đối với giao dịch có is_fraud=1.,AMOUNT_SPIKE; NEW_DEVICE; LOCATION_ANOMALY; HIGH_RISK_MERCHANT; FAILED_THEN_SUCCESS; VELOCITY_BURST,,Để trống với giao dịch normal.
+53,fraud_labels_sample.csv,risk_pattern,category,NO,Tên pattern rủi ro tham chiếu dùng cho dữ liệu mẫu.,NORMAL hoặc một trong các pattern được công bố,NORMAL,Phục vụ phân tích mẫu và đánh giá giải thích.
