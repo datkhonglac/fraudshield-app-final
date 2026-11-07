@@ -157,6 +157,7 @@ box-shadow:0 1px 2px rgba(15,23,42,.04)}
 .fs-k .s{font-size:12px;color:var(--muted);margin-top:6px;line-height:1.45}
 .fs-k .tag{position:absolute;right:14px;top:14px;background:var(--cbg);color:var(--c);font-size:11.5px;font-weight:700;
 padding:2px 9px;border-radius:999px}
+.fs-k:has(.tag){padding-top:36px}.fs-k:has(.tag) .tag{top:10px}
 .fs-k::before{content:"";position:absolute;left:0;top:14px;bottom:14px;width:4px;border-radius:0 4px 4px 0;background:var(--c)}
 /* ---------- huy hiệu ---------- */
 .fs-badge{display:inline-block;padding:3px 10px;border-radius:7px;font-size:11.5px;font-weight:700;letter-spacing:.02em;white-space:nowrap}
@@ -178,6 +179,8 @@ padding:2px 9px;border-radius:999px}
 .fs-table tr.hl td{font-weight:700;background:#F3F7FF}
 .fs-table tr.bad td{background:#FFF5F5}
 .fs-table .best{color:var(--blue);font-weight:700}
+.fs-table th,.fs-table th.num{white-space:normal;vertical-align:bottom;line-height:1.35}
+.fs-table td:first-child{min-width:150px}
 .fs-table .new{color:var(--high);font-weight:700}
 .fs-table .yes{color:#2F9E44;font-weight:800}.fs-table .no{color:#E03131;font-weight:800}
 /* ---------- chi tiết ---------- */
@@ -1411,8 +1414,7 @@ def eval_overview(res, b):
 def eval_tiers(res):
     rep = res["report"]
     k, ts = rep["kpi"], rep.get("time_split")
-    c1, c2 = st.columns([1.15, 1], gap="medium")
-    with c1, card("ev_tiers"):
+    with card("ev_tiers"):
         title("Bộ chỉ số 3 tầng hành động",
               "Ngưỡng chặn và ngưỡng xác thực thêm đều chọn trên phần huấn luyện của từng fold rồi áp lên phần kiểm tra "
               "(ngưỡng lồng) – con số dưới đây là kết quả ngoài mẫu")
@@ -1437,7 +1439,8 @@ def eval_tiers(res):
                    f"thêm. Ngưỡng chọn ở 5 fold: {', '.join(d(x, 3) for x in k['med_folds'])} · ngưỡng dùng chung: "
                    f"{d(rep['medium_threshold'], 4)}. Lớp ngữ cảnh mở thêm một cửa vào tầng xác thực thêm, ngân sách "
                    f"~{pct(F.CTX_BUDGET, 0)} giao dịch thật.")
-    with c2, card("ev_tiers_type"):
+    c1, c2 = st.columns([1, 1], gap="medium")
+    with c1, card("ev_tiers_type"):
         title("Theo nhóm gian lận", "Số ca bị chặn và số ca được can thiệp (chặn hoặc xác thực thêm)")
         cnt = {t: v for t, v in rep["labeled_counts"].items() if t not in ("NORMAL",)}
         tt = sorted(cnt, key=lambda t: -cnt[t])
@@ -1452,7 +1455,7 @@ def eval_tiers(res):
         fig.update_xaxes(tickformat=".0%", range=[0, 1.05])
         fig.add_vline(x=0.8, line=dict(color=NAVY, dash="dash", width=1))
         chart(fig, "ev_tier_type")
-    with card("ev_tiers_note"):
+    with c2, card("ev_tiers_note"):
         title("Tầng xác thực thêm chặn được gì, không chặn được gì")
         H('<div class="fs fs-sub" style="font-size:13.5px;color:#1F2937;line-height:1.6">Yêu cầu xác thực thêm (OTP/sinh '
           'trắc học) ngăn được kẻ gian chiếm đoạt tài khoản, dùng thông tin thẻ đánh cắp hoặc giao dịch từ thiết bị lạ. '
@@ -1474,15 +1477,15 @@ def eval_loto(rep):
               "tương ứng, học lại hồi quy logistic và trọng số luật trên phần còn lại; Isolation Forest và lớp ngữ cảnh giữ "
               "nguyên (không dùng nhãn gian lận); giữ nguyên ngưỡng hiện hành; đếm số ca của kiểu bị ẩn mà hệ thống vẫn can thiệp")
         has_ctx = "medium_plus_base" in tot
-        rows = [{"t": FRAUD_VN.get(o["type"], o["type"]) if o["type"] != "TỔNG" else "Tổng", "r": o["rules_off"],
+        rows = [{"t": (FRAUD_VN.get(o["type"], o["type"]) + f' (tắt {o["rules_off"].replace("_strong", "").replace(", R1_mild", "")})')
+                 if o["type"] != "TỔNG" else "Tổng", "r": o["rules_off"],
                  "n": o["n"], "h": f'{o["high"]} ({pct(o["high"] / o["n"], 0)})',
                  "b": f'{o.get("medium_plus_base", o["medium_plus"])} ({pct(o.get("medium_plus_base", o["medium_plus"]) / o["n"], 0)})',
                  "m": f'{o["medium_plus"]} ({pct(o["medium_plus"] / o["n"], 0)})', "c": f'+{o.get("ctx_only", 0)}',
                  "q": o["queue"]} for o in lo]
-        cols = [("t", "Kiểu bị ẩn"), ("r", "Luật bị tắt"), ("n", "Số ca"), ("h", "Bị chặn")]
-        cols += ([("b", "Can thiệp – chưa có lớp ngữ cảnh"), ("c", "Lớp ngữ cảnh bắt thêm"),
-                  ("m", "Can thiệp – bản v3.2")] if has_ctx else [("m", "Chặn hoặc xác thực thêm")])
-        cols += [("q", "Vào hàng đợi mẫu mới")]
+        cols = [("t", "Kiểu bị ẩn (luật bị tắt)"), ("n", "Số ca"), ("h", "Bị chặn")]
+        cols += ([("b", "Can thiệp trước v3.2"), ("c", "Lớp ngữ cảnh"), ("m", "Can thiệp v3.2")]
+                 if has_ctx else [("m", "Chặn hoặc xác thực thêm"), ("q", "Vào hàng đợi mẫu mới")])
         table(rows, cols, num_cols=("n", "h", "b", "c", "m", "q"), hl_last=True)
         if has_ctx:
             H(f'<div class="fs fs-reason"><b>Kết luận:</b> với kiểu gian lận mô hình chưa từng học, hệ thống chặn '
@@ -1490,13 +1493,14 @@ def eval_loto(rep):
               f'({pct(tot["medium_plus"] / tot["n"], 1)}). Trước khi có lớp ngữ cảnh con số này là '
               f'{tot["medium_plus_base"]}/{tot["n"]} ({pct(tot["medium_plus_base"] / tot["n"], 1)}): lớp ngữ cảnh bắt thêm '
               f'{tot["ctx_only"]} ca, chủ yếu ở kiểu số tiền đột biến, giao dịch dồn dập và merchant rủi ro – đúng ba kiểu '
-              f'trước đây yếu nhất. Phần chặn ngay không đổi vì lớp ngữ cảnh chỉ bắt xác thực thêm, không tự chặn.</div>')
+              f'trước đây yếu nhất. Phần chặn ngay không đổi vì lớp ngữ cảnh chỉ bắt xác thực thêm, không tự chặn. '
+              f'Hàng đợi nghi vấn mẫu mới (Isolation Forest) thêm {tot["queue"]} ca.</div>')
         else:
             H(f'<div class="fs fs-reason"><b>Kết luận:</b> với kiểu gian lận mô hình chưa từng học, hệ thống vẫn chặn '
               f'{tot["high"]}/{tot["n"]} ca và can thiệp {tot["medium_plus"]}/{tot["n"]} ca.</div>')
     ctx = rep.get("context_layer") or {}
     if has_ctx and ctx.get("tradeoff"):
-        c1, c2 = st.columns([1, 1.15], gap="medium")
+        c2, c1 = st.container(), st.container()
         with c1, card("ev_ctx_how"):
             title("Lớp ngữ cảnh hoạt động thế nào", "Không dùng nhãn gian lận · chạy cả theo lô lẫn thời gian thực, "
                   "cả hệ thống vẫn chấm mỗi giao dịch dưới 1 ms")
