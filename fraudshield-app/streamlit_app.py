@@ -32,6 +32,13 @@ from sklearn.metrics import precision_recall_curve
 import fraud_core as F
 import fs_realtime as RT
 
+# Streamlit Cloud chỉ chạy lại tệp chính khi code đổi, module đã import vẫn là bản cũ trong bộ nhớ -> nạp lại nếu lệch bản
+CORE_VERSION = "FraudShield-v3.2"
+if not str(getattr(F, "VERSION", "")).startswith(CORE_VERSION):
+    import importlib
+    F = importlib.reload(F)
+    RT = importlib.reload(RT)
+
 DEMO_SET = Path(__file__).resolve().parent / "data_demo" / "fs_pay_demo_1000.csv"
 
 # ----------------------------------------------------------------------------- cấu hình chung
@@ -447,7 +454,7 @@ def status_frame(res):
 
 # ----------------------------------------------------------------------------- chạy mô hình (có cache)
 @st.cache_data(show_spinner=False, max_entries=8, ttl=6 * 3600)
-def engine(files: dict, extra=None):
+def engine(files: dict, extra=None, core=CORE_VERSION):
     t0 = time.perf_counter()
     tables, checks, ok = F.validate(files)
     if not ok:
@@ -480,7 +487,7 @@ def start_run(files, notes, source):
         st.write("Dựng hồ sơ hành vi, chấm điểm Rule – Logistic Regression – Isolation Forest, lớp ngữ cảnh")
         st.write("Huấn luyện/đánh giá 5-fold (nếu có nhãn), 3 tầng hành động, thí nghiệm ẩn từng kiểu, gom hồ sơ")
         try:
-            res = engine(files)
+            res = engine(files, core=F.VERSION)
         except Exception as ex:  # noqa
             s.update(label="Lỗi khi chạy mô hình", state="error")
             st.error(f"Lỗi khi chạy mô hình: {ex}")
@@ -501,7 +508,7 @@ def auto_load_sample():
         return False
     with st.spinner("Đang chấm điểm Data Pack BTC… (lần đầu mất vài giây)"):
         files = sample_files()
-        res = engine(files)
+        res = engine(files, core=F.VERSION)
     if not res.get("ok"):
         return False
     store_result(res, files, [], "Data Pack BTC (có sẵn trong ứng dụng)")
@@ -2656,7 +2663,7 @@ def retrain_section(res):
                              disabled=not (sure and c["recommend"]), key="btn_apply"):
                     with st.spinner("Đang học lại toàn bộ mô hình…"):
                         files = st.session_state.get("files") or sample_files()
-                        r2 = engine(files, new.reset_index(drop=True))
+                        r2 = engine(files, new.reset_index(drop=True), core=F.VERSION)
                     vers.append(st.session_state.res)
                     store_result(r2, files, [], res["source"],
                                  label=f"Học lại · +{len(new)} nhãn chuyên viên · {now_vn()}")
@@ -2703,6 +2710,10 @@ def downloads(res):
 # ============================================================================= khung chính
 PAGES = {"overview": page_overview, "tx": page_tx, "cases": page_cases, "eval": page_eval, "live": page_live}
 
+_r0 = st.session_state.get("res")
+if _r0 is not None and getattr(_r0.get("model"), "name", CORE_VERSION)[:len(CORE_VERSION)] != CORE_VERSION:
+    for _k in ("res", "tried_sample", "parity"):
+        st.session_state.pop(_k, None)
 if "res" not in st.session_state and "failed" not in st.session_state and "tried_sample" not in st.session_state:
     st.session_state.tried_sample = True
     auto_load_sample()
