@@ -1935,7 +1935,7 @@ def phone_app(res, standalone=False):
             c = st.columns(2)
             c[0].selectbox("Mạng (IP)", list(IP_VN), key="ph_ip", format_func=lambda x: IP_VN[x])
             c[1].selectbox("OTP", ["Đúng", "Sai 2 lần rồi đúng"], key="ph_otp")
-        H('<div class="fs-sub" style="margin:4px 0 2px">Điền nhanh kịch bản</div>')
+        H('<div class="fs-sub" style="margin:4px 0 2px">Kịch bản demo (điền nhanh)</div>')
         c = st.columns(2)
         for i, nm in enumerate(PRESETS):
             c[i % 2].button(nm, key=f"pre_{i}", width="stretch", on_click=_set_preset, args=(nm, hub))
@@ -2008,25 +2008,35 @@ def monitor_body(res):
         H('<div class="fs lv-feed">' + ("".join(items) or '<div class="fs-sub">Chưa có giao dịch.</div>') + "</div>")
 
 
+def customer_url():
+    try:
+        u = st.context.url
+        if u:
+            return u.split("?")[0].rstrip("/") + "/?view=khach"
+    except Exception:  # noqa
+        pass
+    return "?view=khach"
+
+
 def page_live(res):
     H(re.sub(r"\s*\n\s*", " ", LIVE_CSS))
     hub = hub_get(res)
     m = hub["model"]
-    c = st.columns([2.3, 1.1, 1.3], vertical_alignment="center")
-    c[0].markdown(f"**Trung tâm giám sát thời gian thực** · mô hình học trên {m.info.get('train') or 'toàn bộ nhãn'}, "
-                  f"chấm từng giao dịch ngay khi đến · ngưỡng tạm giữ {d(m.thr, 2)}, xác thực thêm {d(m.med, 2)}")
-    cur = next((k for k, v in BG_SPEEDS.items() if v == hub["speed"]), "1 GD/giây")
-    sp = c[1].segmented_control("Giao dịch nền", list(BG_SPEEDS), default=cur, key="bg_speed",
-                                label_visibility="collapsed")
-    if sp is not None and BG_SPEEDS[sp] != hub["speed"]:
-        with hub["lock"]:
-            hub["speed"] = BG_SPEEDS[sp]; hub["last_tick"] = time.time()
-    c[2].markdown('<a href="?view=khach" target="_blank">📱 Mở điện thoại khách trên máy khác</a>', unsafe_allow_html=True)
-    left, right = st.columns([0.82, 2.18], gap="medium")
-    with left:
-        phone_app(res)
-    with right:
-        st.fragment(monitor_body, run_every=1.0)(res)
+    url = customer_url()
+    with card("live_head"):
+        c = st.columns([2.4, 1.15, 1.05], vertical_alignment="center")
+        c[0].markdown(f"**Trung tâm giám sát thời gian thực** · mô hình học trên {m.info.get('train') or 'toàn bộ nhãn'}, "
+                      f"chấm từng giao dịch ngay khi đến · ngưỡng tạm giữ {d(m.thr, 2)}, xác thực thêm {d(m.med, 2)}")
+        cur = next((k for k, v in BG_SPEEDS.items() if v == hub["speed"]), "1 GD/giây")
+        sp = c[1].segmented_control("Giao dịch nền", list(BG_SPEEDS), default=cur, key="bg_speed",
+                                    help="Giao dịch nền phát lại từ dữ liệu BTC tháng 5–6 để màn hình luôn có hoạt động")
+        if sp is not None and BG_SPEEDS[sp] != hub["speed"]:
+            with hub["lock"]:
+                hub["speed"] = BG_SPEEDS[sp]; hub["last_tick"] = time.time()
+        c[2].link_button("Mở ứng dụng khách FS Pay", url, icon=":material/smartphone:", type="primary", width="stretch")
+        st.caption(f"Ứng dụng khách mở ở tab hoặc thiết bị riêng (gửi link sang điện thoại: {url}). Giao dịch khách thực hiện "
+                   "sẽ hiện ở đây trong khoảng 1 giây, kèm nhãn 📱.")
+    st.fragment(monitor_body, run_every=1.0)(res)
     with st.expander("Bằng chứng kỹ thuật: kiểm tra trùng khớp chấm theo luồng và chấm theo lô", icon=":material/fact_check:"):
         par = st.session_state.setdefault("parity", {})
         st.caption(f"Cho toàn bộ {n0(len(res['df']))} giao dịch đi qua bộ chấm luồng từng giao dịch một và đối chiếu với chấm "
@@ -2043,8 +2053,10 @@ def page_live(res):
 def page_customer(res):
     """Giao diện riêng cho điện thoại khách: mở link ?view=khach."""
     H(re.sub(r"\s*\n\s*", " ", LIVE_CSS))
-    H('<style>section[data-testid="stSidebar"],header[data-testid="stHeader"]{display:none}'
-      '.block-container,[data-testid="stMainBlockContainer"]{max-width:460px!important;padding-top:.6rem}</style>')
+    H('<style>section[data-testid="stSidebar"],header[data-testid="stHeader"],[data-testid="stToolbar"],'
+      '[data-testid="collapsedControl"],[data-testid="stSidebarCollapsedControl"]{display:none!important}'
+      '.block-container,[data-testid="stMainBlockContainer"]{max-width:440px!important;padding-top:1rem!important}'
+      '.stApp{background:linear-gradient(160deg,#E8EEFC 0%,#F3F6FB 60%)!important}</style>')
     phone_app(res, standalone=True)
     st.caption("Ứng dụng thanh toán mô phỏng phục vụ trình diễn Fraud Shield – không phải ứng dụng của ngân hàng thật.")
 
