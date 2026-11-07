@@ -1765,7 +1765,7 @@ def pending_panel(hub, res, kp, limit=5):
         sla, col = sla_left(ev)
         src = '<span class="lv-src">📱 Điện thoại khách</span>' if ev["src"] != "Dữ liệu BTC" else ""
         H(f'<div class="fs lv-alert" style="--c:{LEVEL_COLOR[ev["level"]]}"><div class="h"><span>{badge(ev["level"])} '
-          f'<b>{e(ev["tid"])}</b> · {e(ev["cust"])} · <b>{money(ev["amount"])}</b>{src}</span>'
+          f'<b>{e(ev["tid"])}</b> · {e(who(ev))} · <b>{money(ev["amount"])}</b>{src}</span>'
           f'<span class="lv-sla" style="color:{col}">{sla}</span></div>'
           f'<div class="d">{e(ev["reason"])}</div></div>')
         c = st.columns(3)
@@ -1860,7 +1860,7 @@ def monitor_body(res):
         for x in evs[-10:][::-1]:
             src = '<span class="lv-src">📱 Điện thoại khách</span>' if x["src"] != "Dữ liệu BTC" else ""
             items.append(f'<div class="lv-it {"new" if now - x["wall"] < 2.5 else ""}" style="--c:{LEVEL_COLOR[x["level"]]}">'
-                         f'<span class="t">{x["dt"]:%H:%M:%S}</span><span class="m"><b>{e(x["cust"])}</b> → {e(x["merchant"])} '
+                         f'<span class="t">{x["dt"]:%H:%M:%S}</span><span class="m"><b>{e(who(x))}</b> → {e(x["merchant"])} '
                          f'{e(x["cat"])} · {e(PROV_VN.get(x["loc"], x["loc"]))} · IP {e(x["ip"])}{src}</span>'
                          f'<span class="r"><b>{money(x["amount"])}</b> {badge(x["level"])}'
                          f'<span class="act">{e(x["status"])}</span></span></div>')
@@ -1919,8 +1919,21 @@ CAT_ICON = {"DIGITAL_SERVICE": "📶", "DINING": "🍜", "EDUCATION": "🎓", "E
             "MONEY_TRANSFER": "💸", "ONLINE_MARKETPLACE": "📦", "OTHER": "🧾", "TRAVEL": "✈️"}
 QUICK = [("💸", "Chuyển tiền", ["MONEY_TRANSFER"]), ("🧾", "Hoá đơn", ["DIGITAL_SERVICE", "EDUCATION", "HEALTHCARE"]),
          ("🛍️", "Mua sắm", ["FASHION", "ELECTRONICS", "ONLINE_MARKETPLACE", "GROCERY"]),
-         ("📱", "Nạp tiền ĐT", ["DIGITAL_SERVICE"]), ("✈️", "Vé, khách sạn", ["TRAVEL", "HOTEL"]),
-         ("🎮", "Game, giải trí", ["GAMING", "ENTERTAINMENT"]), ("🍜", "Ăn uống", ["DINING"]), ("⋯", "Tất cả", None)]
+         ("📱", "Nạp ĐT", ["DIGITAL_SERVICE"]), ("✈️", "Du lịch", ["TRAVEL", "HOTEL"]),
+         ("🎮", "Giải trí", ["GAMING", "ENTERTAINMENT"]), ("🍜", "Ăn uống", ["DINING"]), ("⋯", "Tất cả", None)]
+# Tên minh hoạ (hư cấu) cho khách demo – dữ liệu BTC chỉ có mã khách đã ẩn danh
+DEMO_NAMES = ["Nguyễn Minh Anh", "Trần Quốc Bảo", "Lê Thu Hà", "Phạm Đức Huy", "Hoàng Ngọc Lan", "Vũ Thanh Tùng",
+              "Đặng Mai Phương", "Bùi Gia Khánh", "Đỗ Hải Yến", "Ngô Tuấn Kiệt", "Dương Thảo Vy", "Lý Hoàng Nam"]
+
+
+def cust_name(cid, custs):
+    return DEMO_NAMES[custs.index(cid) % len(DEMO_NAMES)] if cid in custs else cid
+
+
+def who(ev):
+    return f'{ev["name"]} ({ev["cust"]})' if ev.get("name") else ev["cust"]
+
+
 DEVICES = ["📱 Máy quen", "🆕 Máy lạ, vừa đăng nhập", "⚠️ Máy đã root / giả lập"]
 CHANNELS = {"MOBILE_BANKING": "App ngân hàng", "E_WALLET": "Ví điện tử", "CARD": "Thẻ", "QR": "Quét QR",
             "BANK_TRANSFER": "Chuyển khoản"}
@@ -1979,7 +1992,9 @@ font-size:42px;margin:0 auto 14px}.ph-res h3{font-size:19px;margin:0 0 6px;color
 .ph-res p{font-size:13px;color:#475569;line-height:1.5;margin:0}
 .st-key-fsphone [class*="st-key-qa_"] button{height:76px;border-radius:16px;border:none;background:#fff;
 box-shadow:0 2px 8px rgba(15,23,42,.05);padding:4px 2px;font-size:11px;line-height:1.2;white-space:normal}
-.st-key-fsphone [class*="st-key-qa_"] button p{font-size:11px!important}
+.st-key-fsphone [class*="st-key-qa_"] button p{font-size:11px!important;white-space:normal!important;overflow:visible!important;
+text-overflow:clip!important;line-height:1.25!important}
+.st-key-fsphone [class*="st-key-qa_"] button div{overflow:visible!important;white-space:normal!important}
 .st-key-fsphone [class*="st-key-chip_"] button{border-radius:20px;background:#EEF3FF;color:#1E56C8;border:none;
 font-size:11.5px;min-height:30px;padding:2px 6px}
 .st-key-fspanel{background:#fff;border-radius:22px;border:1px solid #E3E8F0;box-shadow:0 14px 34px rgba(15,23,42,.08);
@@ -2106,6 +2121,7 @@ def _ph_submit(hub):
                  "is_card_present": False, "authentication_method": "BIOMETRIC" if ss.ph_dev == DEVICES[0] else "OTP"}
             ev = _push(hub, t, "Điện thoại khách")
             ev["note"] = ss.get("ph_note", "")
+            ev["name"] = ss.get("ph_name")
             ids.append(ev["id"])
     ss.ph_mine = (ss.get("ph_mine", []) + ids)[-30:]
     ss.ph_last = ids[-1]
@@ -2139,7 +2155,7 @@ def ph_home(hub, prof):
     spent = sum(x["amount"] for x in mine if x["status"].startswith("Thành công") or x["status"].startswith("Đã xác thực"))
     _status_bar(True)
     H(f'<div class="fs ph-full ph-blue ph-hero"><div class="row"><div><div class="hi">Xin chào,</div>'
-      f'<div class="nm">Khách hàng {e(ss.ph_cust)}</div></div><div class="bell">🔔</div></div></div>'
+      f'<div class="nm">{e(ss.get("ph_name") or ss.ph_cust)}</div></div><div class="bell">🔔</div></div></div>'
       f'<div class="fs ph-full"><div class="ph-bal"><div class="l">Tài khoản thanh toán</div>'
       f'<div class="v">{money(25_430_000 - spent)}</div><div class="a"><span>STK {e(ss.ph_cust[-4:])} 2026 01</span>'
       f'<b>Ẩn số dư</b></div></div></div>')
@@ -2248,7 +2264,7 @@ def control_panel(hub, custs, prof):
           'tin ngân hàng thu được ngầm từ thiết bị và mạng.</div>')
         H('<div class="fs pn-g">Khách hàng đăng nhập</div>')
         st.selectbox("Khách hàng", custs, key="ph_cust", label_visibility="collapsed", on_change=_ph_reset_cust,
-                     format_func=lambda c: f"{c} · {PROV_VN.get(cust_profile(hub, c)['home'], '')} · chi thường "
+                     format_func=lambda c: f"{cust_name(c, custs)} · {c} · {PROV_VN.get(cust_profile(hub, c)['home'], '')} · chi thường "
                                            f"~{money(cust_profile(hub, c)['avg'])}")
         H('<div class="fs pn-g">Thiết bị</div>')
         st.segmented_control("Thiết bị", DEVICES, key="ph_dev", label_visibility="collapsed",
@@ -2291,7 +2307,8 @@ def control_panel(hub, custs, prof):
         else:
             st.caption("Chưa gửi giao dịch nào.")
         st.caption("Ứng dụng thanh toán mô phỏng “FS Pay” phục vụ trình diễn Fraud Shield – không phải ứng dụng của ngân "
-                   "hàng thật. Mô hình chấm điểm không dùng giờ trong ngày nên bảng không có mục thời điểm.")
+                   "hàng thật. Tên khách là tên minh hoạ (hư cấu) gắn với mã khách đã ẩn danh trong dữ liệu BTC. Mô hình "
+                   "chấm điểm không dùng giờ trong ngày nên bảng không có mục thời điểm.")
 
 
 def phone_screen(hub, prof):
@@ -2318,6 +2335,7 @@ def page_customer(res):
         st.caption("Không có khách hàng mẫu.")
         return
     prof = _ph_defaults(hub, custs)
+    st.session_state.ph_name = cust_name(st.session_state.ph_cust, custs)
     left, right = st.columns([1, 1.35], gap="large")
     with left:
         with st.container(key="fsphone"):
