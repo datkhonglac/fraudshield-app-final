@@ -1925,6 +1925,7 @@ DEVICES = ["📱 Máy quen", "🆕 Máy lạ, vừa đăng nhập", "⚠️ Máy
 CHANNELS = {"MOBILE_BANKING": "App ngân hàng", "E_WALLET": "Ví điện tử", "CARD": "Thẻ", "QR": "Quét QR",
             "BANK_TRANSFER": "Chuyển khoản"}
 OTP_MODES = ["Nhập đúng", "Nhập sai 2 lần trước"]
+GAPS = {"Vài giờ trước": 3 * 3600, "3 phút trước": 180}
 PRESETS = {
     "🛒 Mua sắm bình thường": dict(desc="Máy quen, ở nhà, số tiền như mọi khi", dev=0, home=True, ip="VN", otp=0,
                                    mult=1.0, cat=["FASHION", "GROCERY", "ONLINE_MARKETPLACE"], mrisk="LOW"),
@@ -2028,6 +2029,7 @@ def _ph_defaults(hub, custs):
     ss.setdefault("ph_ip", "VN")
     ss.setdefault("ph_chan", prof["chan"] if prof["chan"] in CHANNELS else "MOBILE_BANKING")
     ss.setdefault("ph_otp", OTP_MODES[0])
+    ss.setdefault("ph_gap", list(GAPS)[0])
     ss.setdefault("ph_amt", int(round(prof["avg"] / 1000) * 1000))
     ss.setdefault("ph_cat", None)
     ss.setdefault("ph_mer", hub["merch"].merchant_id.iloc[0])
@@ -2057,6 +2059,7 @@ def _ph_preset(name, hub):
     ss.ph_loc = prof["home"] if p["home"] else other[sum(map(ord, ss.ph_cust)) % len(other)]
     ss.ph_ip = p["ip"]
     ss.ph_otp = OTP_MODES[p["otp"]]
+    ss.ph_gap = list(GAPS)[0]
     ss.ph_chan = prof["chan"] if prof["chan"] in CHANNELS else "MOBILE_BANKING"
     ss.ph_amt = int(round(prof["avg"] * p["mult"] / 1000) * 1000)
     ms = hub["merch"]
@@ -2087,10 +2090,16 @@ def _ph_submit(hub):
                                       "rooted_or_jailbroken": rooted, "emulator_flag": False}
                 ss.ph_newdev = dev
         statuses = ["FAILED", "FAILED", "SUCCESS"] if ss.ph_otp == OTP_MODES[1] else ["SUCCESS"]
+        # Thời điểm giao dịch: sau đồng hồ luồng, và cách giao dịch trước của chính khách đúng khoảng đã chọn
+        # (mặc định vài giờ – để các lần bấm thử liên tiếp không bị coi là "dồn dập trong 5 phút").
+        last = hub["sc"].C.get(cid, {}).get("last")
+        base = hub["clock"] + pd.Timedelta(seconds=15)
+        if last is not None:
+            base = max(base, pd.Timestamp("2000-01-01") + pd.Timedelta(seconds=last + GAPS.get(ss.get("ph_gap"), 3 * 3600)))
         ids = []
         for k, sts in enumerate(statuses):
-            t0 = hub["clock"] + pd.Timedelta(seconds=20 if k else 15)
-            hub["clock"] = t0
+            t0 = base + pd.Timedelta(seconds=20 * k)
+            hub["clock"] = max(hub["clock"], t0)
             t = {"transaction_id": f"LIVE-{hub['seq'] + 1:04d}", "customer_id": cid, "merchant_id": ss.ph_mer,
                  "datetime": t0, "amount": float(ss.ph_amt), "currency": "VND", "payment_channel": ss.ph_chan,
                  "device_id": dev, "location": ss.ph_loc, "transaction_status": sts, "ip_country": ss.ph_ip,
@@ -2260,6 +2269,9 @@ def control_panel(hub, custs, prof):
         with c[1]:
             H('<div class="fs pn-g">Khi được hỏi OTP</div>')
             st.segmented_control("OTP", OTP_MODES, key="ph_otp", label_visibility="collapsed")
+        H('<div class="fs pn-g">Giao dịch trước của khách này diễn ra</div>')
+        st.segmented_control("Khoảng cách", list(GAPS), key="ph_gap", label_visibility="collapsed",
+                             help="Mặc định vài giờ trước. Chọn 3 phút trước để thử tình huống giao dịch dồn dập (luật R6).")
         H('<div class="fs pn-g">Kịch bản nhanh (bấm là điền sẵn cả app lẫn bảng này)</div>')
         names = list(PRESETS)
         for i in range(0, 4, 2):
