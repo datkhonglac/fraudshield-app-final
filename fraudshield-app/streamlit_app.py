@@ -16,6 +16,7 @@ import json
 import re
 import sqlite3
 import tempfile
+import threading
 import time
 import zipfile
 from contextlib import closing
@@ -145,7 +146,7 @@ box-shadow:0 1px 2px rgba(15,23,42,.04)}
 .fs-k .l{font-size:13px;color:#475467;display:flex;align-items:center;gap:7px;margin-top:6px;font-weight:500}
 .fs-k .l i{width:8px;height:8px;border-radius:50%;background:var(--c);flex:none}
 .fs-k .s{font-size:12px;color:var(--muted);margin-top:6px;line-height:1.45}
-.fs-k .tag{position:absolute;right:14px;bottom:14px;background:var(--cbg);color:var(--c);font-size:11.5px;font-weight:700;
+.fs-k .tag{position:absolute;right:14px;top:14px;background:var(--cbg);color:var(--c);font-size:11.5px;font-weight:700;
 padding:2px 9px;border-radius:999px}
 .fs-k::before{content:"";position:absolute;left:0;top:14px;bottom:14px;width:4px;border-radius:0 4px 4px 0;background:var(--c)}
 /* ---------- huy hiệu ---------- */
@@ -241,9 +242,6 @@ display:flex;justify-content:space-between;flex-wrap:wrap;gap:8px}
 </style>
 """
 st.markdown(re.sub(r"\s*\n\s*", " ", CSS), unsafe_allow_html=True)
-if not st.get_option("theme.primaryColor"):
-    st.warning("Thiếu tệp .streamlit/config.toml trong repo nên màu giao diện chưa đúng – hãy tải cả thư mục "
-               ".streamlit lên GitHub (xem README).", icon=":material/palette:")
 
 
 # ----------------------------------------------------------------------------- tiện ích hiển thị
@@ -1135,6 +1133,9 @@ def page_cases(res):
                          sla=cases.case_level.map(SLA_TXT))
     cnt = cases.case_status.value_counts()
     urgent = cases[(cases.case_level == "CRITICAL") & (cases.case_status != "Đã xử lý")]
+    hub = live_hub(hub_key(res))
+    if hub.get("ready"):
+        st.fragment(queue_live_box, run_every=2.0)(hub, res)
     kgrid([kcard(n0(len(cases)), "Tổng hồ sơ", LEVEL_COLOR["CRITICAL"], f"gom từ {n0(res['report']['n_alerts'])} giao dịch bị tạm dừng"),
            kcard(n0(cnt.get("Chưa xử lý", 0)), "Chưa xử lý", LEVEL_COLOR["HIGH"],
                  f"trong đó {n0(len(urgent))} hồ sơ khẩn cấp (SLA 5 phút)"),
@@ -1607,7 +1608,192 @@ def eval_fair(rep):
 
 
 # ============================================================================= LUỒNG THỜI GIAN THỰC
-SPEEDS = {"1 GD/giây": 1, "2 GD/giây": 2, "5 GD/giây": 5, "Tua nhanh · 50 GD/giây": 50}
+# Trung tâm dùng chung cho mọi phiên trên máy chủ: điện thoại khách (kể cả mở trên máy thật qua link ?view=khach)
+# gửi giao dịch vào đây, màn hình giám sát đọc ra mỗi giây. Một bảng trạng thái, một luồng, một khóa.
+PROV_VN = {"Hanoi": "Hà Nội", "Ho Chi Minh City": "TP. Hồ Chí Minh", "Da Nang": "Đà Nẵng", "Hai Phong": "Hải Phòng",
+           "Can Tho": "Cần Thơ", "Thanh Hoa": "Thanh Hóa", "Nghe An": "Nghệ An", "Hung Yen": "Hưng Yên",
+           "Bac Ninh": "Bắc Ninh", "Quang Ninh": "Quảng Ninh"}
+IP_VN = {"VN": "Việt Nam", "SG": "Singapore", "TH": "Thái Lan", "US": "Mỹ", "JP": "Nhật Bản", "KR": "Hàn Quốc",
+         "MY": "Malaysia"}
+BG_SPEEDS = {"Tạm dừng": 0.0, "1 GD/giây": 1.0, "3 GD/giây": 3.0}
+ST_PENDING = {"CRITICAL": "Tạm giữ · chờ giám sát viên", "HIGH": "Tạm giữ · chờ giám sát viên",
+              "MEDIUM": "Chờ khách xác thực OTP", "LOW": "Thành công"}
+DONE_LIVE = {"block": "Đã chặn giao dịch", "cancel": "Đã huỷ · hoàn tiền cho khách", "ok": "Đã xác thực · cho qua"}
+PRESETS = {
+    "Mua sắm bình thường": dict(dev="Máy quen của tôi", place="Nơi ở", ip="VN", otp="Đúng", mult=1.0, mrisk="LOW"),
+    "Máy lạ ở nước ngoài": dict(dev="Máy lạ", place="Tỉnh khác", ip="SG", otp="Đúng", mult=5.0, mrisk="LOW"),
+    "Thử sai OTP liên tục": dict(dev="Máy lạ", place="Nơi ở", ip="VN", otp="Sai 2 lần rồi đúng", mult=3.0, mrisk="LOW"),
+    "Chuyển gấp 10 lần": dict(dev="Máy quen của tôi", place="Nơi ở", ip="VN", otp="Đúng", mult=10.0, mrisk="HIGH"),
+}
+
+LIVE_CSS = """<style>
+.lv-strip{display:flex;align-items:center;gap:18px;flex-wrap:wrap;background:#0B2552;color:#fff;border-radius:14px;
+padding:12px 18px;margin-bottom:14px}
+.lv-on{display:inline-flex;align-items:center;gap:8px;font-weight:800;letter-spacing:.06em;font-size:13px}
+.lv-on i{width:11px;height:11px;border-radius:50%;background:#2FD36B;box-shadow:0 0 0 0 rgba(47,211,107,.7);animation:lvp 1.4s infinite}
+.lv-on.off i{background:#98A2B3;animation:none}
+@keyframes lvp{0%{box-shadow:0 0 0 0 rgba(47,211,107,.7)}70%{box-shadow:0 0 0 10px rgba(47,211,107,0)}100%{box-shadow:0 0 0 0 rgba(47,211,107,0)}}
+.lv-clock{font-variant-numeric:tabular-nums;font-size:13px;color:#C9D6EA}.lv-clock b{color:#fff;font-size:15px}
+.lv-cnt{display:flex;gap:22px;margin-left:auto;flex-wrap:wrap}
+.lv-cnt div{text-align:right;line-height:1.15}.lv-cnt b{display:block;font-size:22px;font-variant-numeric:tabular-nums}
+.lv-cnt span{font-size:11.5px;color:#9FB3D1}
+.lv-feed{display:flex;flex-direction:column;gap:8px}
+.lv-it{display:grid;grid-template-columns:62px 1fr auto;gap:10px;align-items:center;background:#fff;border:1px solid #E3E8F0;
+border-left:5px solid var(--c);border-radius:10px;padding:8px 12px;font-size:13px}
+.lv-it.new{animation:lvin .9s ease-out}
+@keyframes lvin{0%{transform:translateY(-8px);background:#FFF8E1;opacity:.2}100%{transform:none;background:#fff;opacity:1}}
+.lv-it .t{color:#64748B;font-variant-numeric:tabular-nums;font-size:12px}
+.lv-it .m{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.lv-it .m b{color:#0B2552}.lv-it .r{text-align:right;white-space:nowrap}
+.lv-it .act{display:block;font-size:11.5px;color:#475467;margin-top:2px}
+.lv-src{display:inline-block;background:#E8EEFC;color:#1E3A8A;font-size:10.5px;font-weight:700;border-radius:6px;padding:1px 6px;margin-left:6px}
+.lv-alert{border:1px solid #FFD6D6;border-left:5px solid var(--c);background:#FFF8F8;border-radius:10px;padding:10px 12px;margin-bottom:4px}
+.lv-alert .h{display:flex;justify-content:space-between;gap:8px;font-size:13.5px}
+.lv-alert .d{font-size:12.5px;color:#334155;margin-top:4px;line-height:1.45}
+.lv-sla{font-weight:800;font-variant-numeric:tabular-nums}
+[class*="st-key-card_phone"]{max-width:400px;margin:0 auto;border:10px solid #0F172A!important;border-radius:34px!important;
+padding:18px 16px 14px!important;box-shadow:0 18px 40px rgba(15,23,42,.18)!important}
+.ph-top{display:flex;justify-content:space-between;align-items:center;margin-bottom:6px}
+.ph-top .b{font-weight:800;color:#0B2552;font-size:17px}.ph-top .s{font-size:11.5px;color:#64748B}
+.ph-res{border-radius:14px;padding:14px;margin-top:8px;text-align:center}
+.ph-res .ic{font-size:30px;line-height:1}.ph-res .t{font-weight:800;font-size:16px;margin-top:6px}
+.ph-res .d{font-size:12.5px;color:#334155;margin-top:4px;line-height:1.45}
+</style>"""
+
+
+@st.cache_resource(show_spinner=False)
+def live_hub(key):
+    return {"lock": threading.Lock(), "ready": False}
+
+
+def hub_key(res):
+    m = res.get("model_live") or res["model"]
+    return f'{res["ds"]}|{m.name}|{res.get("version_label", "")}'
+
+
+def hub_get(res):
+    hub = live_hub(hub_key(res))
+    m = res.get("model_live") or res["model"]
+    if not hub["ready"]:
+        with hub["lock"]:
+            if not hub["ready"]:
+                T = res["tables"]
+                order = RT.stream_order(T["transactions.csv"])
+                start = m.info.get("start")
+                dtv = pd.to_datetime(order.datetime)
+                hist = order[dtv < start] if start is not None else order.iloc[:0]
+                live = order[dtv >= start] if start is not None else order
+                sc = RT.OnlineScorer(m, T["customers.csv"], T["merchants.csv"], T["devices.csv"])
+                sc.warm(hist.to_dict("records"))
+                lab = T.get("fraud_labels_sample.csv")
+                hub.update(sc=sc, model=m, rows=live.to_dict("records"), i=0, events=[], by_id={}, seq=0,
+                           clock=pd.Timestamp(hist.datetime.iloc[-1]) if len(hist) else pd.Timestamp(order.datetime.iloc[0]),
+                           speed=1.0, last_tick=time.time(), n_hist=len(hist),
+                           labels=dict(zip(lab.transaction_id, lab.is_fraud.astype(int))) if lab is not None else {},
+                           merch=T["merchants.csv"], cust=T["customers.csv"], hist=hist, ready=True)
+    return hub
+
+
+def _push(hub, t, src):
+    r = hub["sc"].score(t)
+    hub["seq"] += 1
+    mm = hub["sc"].merch.get(t["merchant_id"], {})
+    ev = {"id": hub["seq"], "src": src, "tid": t["transaction_id"], "dt": pd.Timestamp(t["datetime"]),
+          "cust": t["customer_id"], "amount": float(t["amount"]), "merchant": t["merchant_id"],
+          "cat": mm.get("merchant_category", ""), "loc": t["location"], "ip": t["ip_country"], "dev": t["device_id"],
+          "tx_status": t["transaction_status"], "score": r["risk_score"], "level": r["risk_level"],
+          "reason": r["alert_reason"], "ms": r["latency_ms"], "wall": time.time(), "nov": r["novelty"],
+          "status": ST_PENDING[r["risk_level"]], "y": hub["labels"].get(t["transaction_id"])}
+    if src == "Dữ liệu BTC" and r["risk_level"] == "MEDIUM":
+        ev["status"] = "Đã yêu cầu xác thực thêm"
+    if t["transaction_status"] != "SUCCESS" and r["risk_level"] in ("LOW", "MEDIUM"):
+        ev["status"] = "Thất bại (sai OTP)"
+    hub["clock"] = max(hub["clock"], ev["dt"])
+    hub["events"].append(ev)
+    hub["by_id"][ev["id"]] = ev
+    if len(hub["events"]) > 3000:
+        for x in hub["events"][:500]:
+            hub["by_id"].pop(x["id"], None)
+        del hub["events"][:500]
+    return ev
+
+
+def hub_tick(hub):
+    """Phát giao dịch nền từ dữ liệu BTC theo tốc độ đã chọn (theo thời gian thật, dùng chung cho mọi người xem)."""
+    with hub["lock"]:
+        now = time.time()
+        if hub["speed"] <= 0 or hub["i"] >= len(hub["rows"]):
+            hub["last_tick"] = now
+            return
+        due = int((now - hub["last_tick"]) * hub["speed"])
+        if due <= 0:
+            return
+        for _ in range(min(due, 20)):
+            if hub["i"] >= len(hub["rows"]):
+                break
+            _push(hub, hub["rows"][hub["i"]], "Dữ liệu BTC")
+            hub["i"] += 1
+        hub["last_tick"] = now
+
+
+def hub_action(hub, ev_id, act, ds):
+    with hub["lock"]:
+        ev = hub["by_id"].get(ev_id)
+        if ev is None or ev["status"] in DONE_LIVE.values():
+            return
+        ev["status"] = DONE_LIVE[act]
+        ev["handled_wall"] = time.time()
+    save_action(ds, "LIVE", ev["tid"], DONE_LIVE[act])
+
+
+def pending_events(hub):
+    with hub["lock"]:
+        evs = [e for e in hub["events"] if e["status"].startswith("Tạm giữ")
+               or (e["status"].startswith("Chờ khách") and e["src"] != "Dữ liệu BTC")]
+    return sorted(evs, key=lambda e: (e["src"] == "Dữ liệu BTC", -e["wall"]))
+
+
+def sla_left(ev):
+    s = SLA_S.get(ev["level"], 600)
+    left = s - (time.time() - ev["wall"])
+    mm, ss = divmod(int(abs(left)), 60)
+    hh, mm = divmod(mm, 60)
+    txt = f"{hh}:{mm:02d}:{ss:02d}" if hh else f"{mm}:{ss:02d}"
+    col = "#2F9E44" if left > s * 0.4 else "#F59F00" if left > 0 else "#E03131"
+    return ("còn " if left > 0 else "quá hạn ") + txt, col
+
+
+def pending_panel(hub, res, kp, limit=5):
+    evs = pending_events(hub)
+    if not evs:
+        st.caption("Không có giao dịch nào đang chờ quyết định.")
+        return 0
+    for ev in evs[:limit]:
+        sla, col = sla_left(ev)
+        src = '<span class="lv-src">📱 Điện thoại khách</span>' if ev["src"] != "Dữ liệu BTC" else ""
+        H(f'<div class="fs lv-alert" style="--c:{LEVEL_COLOR[ev["level"]]}"><div class="h"><span>{badge(ev["level"])} '
+          f'<b>{e(ev["tid"])}</b> · {e(ev["cust"])} · <b>{money(ev["amount"])}</b>{src}</span>'
+          f'<span class="lv-sla" style="color:{col}">{sla}</span></div>'
+          f'<div class="d">{e(ev["reason"])}</div></div>')
+        c = st.columns(3)
+        c[0].button("Chặn", key=f"{kp}_b_{ev['id']}", icon=":material/block:", type="primary", width="stretch",
+                    on_click=hub_action, args=(hub, ev["id"], "block", res["ds"]))
+        c[1].button("Huỷ", key=f"{kp}_c_{ev['id']}", icon=":material/cancel:", width="stretch",
+                    on_click=hub_action, args=(hub, ev["id"], "cancel", res["ds"]))
+        c[2].button("Xác thực", key=f"{kp}_o_{ev['id']}", icon=":material/verified:", width="stretch",
+                    on_click=hub_action, args=(hub, ev["id"], "ok", res["ds"]))
+    if len(evs) > limit:
+        st.caption(f"Còn {len(evs) - limit} giao dịch đang chờ khác.")
+    return len(evs)
+
+
+def queue_live_box(hub, res):
+    if pending_events(hub):
+        with card("q_live"):
+            title("Cảnh báo mới từ luồng thời gian thực",
+                  "Giao dịch đang bị tạm giữ chờ quyết định · Chặn = từ chối giao dịch · Huỷ = huỷ và hoàn tiền · "
+                  "Xác thực = đã xác minh với khách, cho qua")
+            pending_panel(hub, res, "q", limit=4)
 
 
 def parity_view(p):
@@ -1618,162 +1804,249 @@ def parity_view(p):
               f"chênh lớn nhất {p['max_abs_diff']:.1e} · lệch mức: {p['n_level_mismatch']}",
               "Trùng 100%" if ok else "Có lệch", "#E6F4EA" if ok else "#FFE3E3"),
         kcard(f"{d(p['latency_mean_ms'], 2)} ms", "Thời gian chấm 1 giao dịch", PURPLE,
-              f"p95 {d(p['latency_p95_ms'], 2)} ms · p99 {d(p['latency_p99_ms'], 2)} ms · lớn nhất {d(p['latency_max_ms'], 2)} ms"),
+              f"p95 {d(p['latency_p95_ms'], 2)} ms · p99 {d(p['latency_p99_ms'], 2)} ms"),
         kcard(f"{d(p['total_s'], 1)} s", "Tổng thời gian chạy", TEAL,
               f"đặc trưng lệch lớn nhất {p['max_feature_diff']:.1e}")]) + "</div>")
     H(f'<div class="fs fs-reason"><b>Ý nghĩa:</b> bộ chấm luồng chỉ biết các giao dịch đã xảy ra trước đó (bảng trạng thái '
       f'trong bộ nhớ). Điểm của nó trùng với bản chấm theo lô cho {"toàn bộ" if ok else "phần lớn"} {n0(p["n"])} giao dịch – '
-      f'bằng chứng mô hình không dùng dữ liệu tương lai. Cùng một mô hình đóng băng ({e(p["model"])}).</div>')
+      f'bằng chứng mô hình không dùng dữ liệu tương lai.</div>')
 
 
-def live_init(res):
-    m = res.get("model_live") or res["model"]
-    T = res["tables"]
-    order = RT.stream_order(T["transactions.csv"])
-    start = m.info.get("start")
-    dtv = pd.to_datetime(order.datetime)
-    hist = order[dtv < start] if start is not None else order.iloc[:0]
-    live = order[dtv >= start] if start is not None else order
-    sc = RT.OnlineScorer(m, T["customers.csv"], T["merchants.csv"], T["devices.csv"])
-    sc.warm(hist.to_dict("records"))
-    lab = T.get("fraud_labels_sample.csv")
-    st.session_state.live = {
-        "rid": res["rid"], "sc": sc, "rows": live.to_dict("records"), "i": 0, "out": [], "running": False,
-        "n_hist": len(hist), "labels": dict(zip(lab.transaction_id, lab.is_fraud.astype(int))) if lab is not None else {},
-        "handled": set(), "model": m}
+# ---------------------------------------------------------------- điện thoại khách hàng
+@st.cache_data(show_spinner=False)
+def demo_customers(_hist, ds):
+    h = _hist
+    if not len(h):
+        return []
+    cnt = h.customer_id.value_counts()
+    return cnt[cnt >= 8].index[:12].tolist()
 
 
-def live_step(L, n):
-    for _ in range(n):
-        if L["i"] >= len(L["rows"]):
-            L["running"] = False
-            break
-        t = L["rows"][L["i"]]
-        r = L["sc"].score(t)
-        L["out"].append({"tid": t["transaction_id"], "dt": pd.Timestamp(t["datetime"]), "cust": t["customer_id"],
-                         "amount": float(t["amount"]), "merchant": t["merchant_id"], "score": r["risk_score"],
-                         "level": r["risk_level"], "nov": r["novelty"], "reason": r["alert_reason"],
-                         "ms": r["latency_ms"], "wall": time.time(), "y": L["labels"].get(t["transaction_id"])})
-        L["i"] += 1
+def cust_profile(hub, cid):
+    k = hub["sc"].cust.get(cid, {})
+    h = hub["hist"][hub["hist"].customer_id == cid]
+    dev = h.device_id.mode().iloc[0] if len(h) else f"DEV-{cid}"
+    return {"home": k.get("home_location", "Hanoi"), "avg": float(k.get("avg_transaction_amount", 1e6) or 1e6),
+            "dev": dev, "seg": k.get("customer_segment", "")}
 
 
-def live_body():
-    L = st.session_state.live
-    if L["running"]:
-        live_step(L, SPEEDS.get(st.session_state.get("live_speed"), 2))
-    out = L["out"]
-    o = pd.DataFrame(out) if out else pd.DataFrame(columns=["tid", "dt", "cust", "amount", "merchant", "score", "level",
-                                                             "nov", "reason", "ms", "wall", "y"])
-    lv = o.level.value_counts() if len(o) else pd.Series(dtype=int)
-    ms = o.ms.values if len(o) else np.array([0.0])
-    clock = o.dt.iloc[-1] if len(o) else None
-    kgrid([kcard(f"{n0(len(o))}/{n0(len(L['rows']))}", "Giao dịch đã chấm", BLUE,
-                 f"đồng hồ luồng: {clock:%d/%m/%Y %H:%M:%S}" if clock is not None else "chưa bắt đầu"),
-           kcard(n0(lv.get("CRITICAL", 0) + lv.get("HIGH", 0)), "Tạm dừng giao dịch", LEVEL_COLOR["CRITICAL"],
-                 f"CRITICAL {n0(lv.get('CRITICAL', 0))} · HIGH {n0(lv.get('HIGH', 0))}"),
-           kcard(n0(lv.get("MEDIUM", 0)), "Yêu cầu xác thực thêm", LEVEL_COLOR["MEDIUM"],
-                 f"cho qua {n0(lv.get('LOW', 0))} · nghi vấn mẫu mới {n0(int(o.nov.sum()) if len(o) else 0)}"),
-           kcard(f"{d(float(np.mean(ms)), 2)} ms", "Thời gian chấm 1 giao dịch", PURPLE,
-                 f"p99 {d(float(np.percentile(ms, 99)), 2)} ms · lớn nhất {d(float(np.max(ms)), 2)} ms")])
-    if len(o):
-        last_alert = o[o.level.isin(["CRITICAL", "HIGH"])].tail(1)
-        if len(last_alert):
-            a = last_alert.iloc[0]
-            fresh = time.time() - a.wall < 4
-            H(f'<div class="fs fs-warnbox" style="{"" if fresh else "opacity:.8"}"><div class="ic">!</div><div>'
-              f'<div class="t">{"Vừa tạm dừng" if fresh else "Lần tạm dừng gần nhất"}: {e(a.tid)} · {e(a.cust)} · '
-              f'{money(a.amount)} · {badge(a.level)}</div><div class="d">{e(a.reason)}</div></div></div>')
-    c1, c2 = st.columns([1.45, 1], gap="medium")
-    with c1, card("live_feed"):
-        title("Giao dịch vừa chấm", "Mới nhất ở trên · mỗi giao dịch được chấm ngay khi đến, chỉ dùng thông tin trước đó")
-        if len(o):
-            rows = []
-            for r in o.tail(14).iloc[::-1].itertuples():
-                rows.append(f'<tr><td>{r.dt:%d/%m %H:%M:%S}</td><td class="mono">{e(r.tid)}</td><td>{e(r.cust)}</td>'
-                            f'<td class="num">{n0(r.amount)}</td><td class="num" style="font-weight:700;color:'
-                            f'{LEVEL_COLOR[r.level] if r.level != "LOW" else "#475467"}">{d(r.score, 3)}</td>'
-                            f'<td>{badge(r.level)}</td><td>{ACTION_SHORT[r.level] + (" · mẫu mới?" if r.nov else "")}</td>'
-                            f'<td class="num">{d(r.ms, 2)}</td></tr>')
-            H('<div class="fs fs-tw"><table class="fs-table"><thead><tr><th>Thời điểm</th><th>Giao dịch</th><th>Khách</th>'
-              '<th class="num">Số tiền</th><th class="num">Điểm</th><th>Mức</th><th>Hành động</th><th class="num">ms</th>'
-              '</tr></thead><tbody>' + "".join(rows) + "</tbody></table></div>")
+def _set_preset(name, hub):
+    p = PRESETS[name]
+    st.session_state.ph_dev = p["dev"]; st.session_state.ph_place = p["place"]
+    st.session_state.ph_ip = p["ip"]; st.session_state.ph_otp = p["otp"]
+    prof = cust_profile(hub, st.session_state.get("ph_cust"))
+    st.session_state.ph_amt = int(round(prof["avg"] * p["mult"] / 1000) * 1000)
+    ms = hub["merch"]
+    pool = ms[ms.merchant_risk_level == p["mrisk"]]
+    if len(pool):
+        st.session_state.ph_mer = pool.merchant_id.iloc[0]
+
+
+def phone_submit(hub, res):
+    cid = st.session_state.ph_cust
+    prof = cust_profile(hub, cid)
+    other = [p for p in PROV_VN if p != prof["home"]]
+    loc = prof["home"] if st.session_state.ph_place == "Nơi ở" else other[hash(cid) % len(other)]
+    with hub["lock"]:
+        if st.session_state.ph_dev == "Máy lạ":
+            dev = st.session_state.get("ph_newdev")
+            if not dev:
+                dev = f"DEV-LA-{hub['seq'] + 1:04d}"
+                hub["sc"].dev[dev] = {"first_seen_date": hub["clock"].normalize(), "registered_customer_id": None,
+                                      "device_risk_level": "MEDIUM", "rooted_or_jailbroken": False, "emulator_flag": False}
+                st.session_state.ph_newdev = dev
         else:
-            st.caption("Bấm Bắt đầu để phát luồng giao dịch.")
-    with c2, card("live_sla"):
-        title("Hàng đợi trực tiếp · đồng hồ SLA",
-              "Cảnh báo vừa phát sinh trong phiên giả lập · CRITICAL phải phản ứng trong 5 phút, HIGH trong 2 giờ")
-        al = o[o.level.isin(["CRITICAL", "HIGH"]) & ~o.tid.isin(L["handled"])] if len(o) else o
-        if len(al):
-            now = time.time()
-            rows = []
-            for r in al.tail(8).iloc[::-1].itertuples():
-                left = SLA_S[r.level] - (now - r.wall)
-                mm, ss = divmod(int(abs(left)), 60)
-                hh, mm = divmod(mm, 60)
-                tl = (f"{hh}:{mm:02d}:{ss:02d}" if hh else f"{mm}:{ss:02d}")
-                col = "#2F9E44" if left > SLA_S[r.level] * 0.4 else "#F59F00" if left > 0 else "#E03131"
-                rows.append(f'<tr><td class="mono">{e(r.tid)}</td><td>{badge(r.level)}</td>'
-                            f'<td class="num" style="color:{col};font-weight:700">{"còn " if left > 0 else "quá hạn "}{tl}</td></tr>')
-            H('<div class="fs fs-tw"><table class="fs-table"><thead><tr><th>Giao dịch</th><th>Mức</th><th class="num">SLA</th>'
-              '</tr></thead><tbody>' + "".join(rows) + "</tbody></table></div>")
-            c = st.columns([2, 1], vertical_alignment="bottom")
-            pick = c[0].selectbox("Đánh dấu đã xử lý", al.tid.tolist()[::-1], key="live_pick", label_visibility="collapsed")
-            if c[1].button("Đã xử lý", key="live_done", width="stretch"):
-                L["handled"].add(pick)
-        else:
-            st.caption("Chưa có cảnh báo nào đang chờ.")
-        lab = o[o.y.notna()] if len(o) else o
-        if len(lab):
-            fr, lg = lab[lab.y == 1], lab[lab.y == 0]
-            H('<div class="fs-h" style="margin-top:12px">Đối chiếu đáp án BTC (giao dịch có nhãn trong luồng)</div>')
-            table([{"k": f"Gian lận thật ({len(fr)})",
-                    "a": f'{int(fr.level.isin(["CRITICAL", "HIGH"]).sum())} chặn · {int((fr.level == "MEDIUM").sum())} '
-                         f'xác thực thêm · {int((fr.level == "LOW").sum())} lọt'},
-                   {"k": f"Giao dịch thật ({len(lg)})",
-                    "a": f'{int(lg.level.isin(["CRITICAL", "HIGH"]).sum())} chặn nhầm · {int((lg.level == "MEDIUM").sum())} '
-                         f'phải xác thực thêm'}], [("k", "Nhóm"), ("a", "Hệ thống đã làm gì")])
+            dev = prof["dev"]
+        otp = st.session_state.ph_otp
+        statuses = ["FAILED", "FAILED", "SUCCESS"] if otp.startswith("Sai") else ["SUCCESS"]
+        ids = []
+        for k, sts in enumerate(statuses):
+            t0 = hub["clock"] + pd.Timedelta(seconds=20 if k else 15)
+            hub["clock"] = t0
+            t = {"transaction_id": f"LIVE-{hub['seq'] + 1:04d}", "customer_id": cid,
+                 "merchant_id": st.session_state.ph_mer, "datetime": t0, "amount": float(st.session_state.ph_amt),
+                 "currency": "VND", "payment_channel": "MOBILE_BANKING", "device_id": dev, "location": loc,
+                 "transaction_status": sts, "ip_country": st.session_state.ph_ip, "is_card_present": False,
+                 "authentication_method": "BIOMETRIC" if st.session_state.ph_dev != "Máy lạ" else "OTP"}
+            ids.append(_push(hub, t, "Điện thoại khách")["id"])
+    st.session_state.ph_last = ids[-1]
+
+
+def phone_otp(hub, ev_id, ok):
+    with hub["lock"]:
+        ev = hub["by_id"].get(ev_id)
+        if ev and ev["status"].startswith("Chờ khách"):
+            ev["status"] = "Thành công sau xác thực OTP" if ok else "Khách từ chối · đã huỷ"
+
+
+def phone_result(hub):
+    ev = hub["by_id"].get(st.session_state.get("ph_last"))
+    if not ev:
+        return
+    s = ev["status"]
+    if s.startswith("Thành công") or s.startswith("Đã xác thực"):
+        bg, ic, t, dsc = "#E6F4EA", "✅", "Thanh toán thành công", s
+    elif s.startswith("Chờ khách"):
+        bg, ic, t, dsc = "#FFF8E1", "🔐", "Cần xác thực thêm", "Giao dịch có dấu hiệu bất thường. Nhập mã OTP vừa gửi để tiếp tục."
+    elif s.startswith("Tạm giữ"):
+        bg, ic, t, dsc = "#FFF4E6", "⏳", "Giao dịch đang được kiểm tra", ("Ngân hàng tạm giữ giao dịch để xác minh. "
+                                                                             "Vui lòng chờ trong giây lát…")
+    else:
+        bg, ic, t, dsc = "#FFE3E3", "⛔", "Giao dịch không thành công", s
+    H(f'<div class="fs ph-res" style="background:{bg}"><div class="ic">{ic}</div><div class="t">{t}</div>'
+      f'<div class="d">{e(ev["tid"])} · {money(ev["amount"])}<br>{e(dsc)}</div></div>')
+    if s.startswith("Chờ khách"):
+        c = st.columns(2)
+        c[0].button("Nhập OTP đúng", key=f"ph_ok_{ev['id']}", type="primary", width="stretch",
+                    on_click=phone_otp, args=(hub, ev["id"], True))
+        c[1].button("Không phải tôi", key=f"ph_no_{ev['id']}", width="stretch",
+                    on_click=phone_otp, args=(hub, ev["id"], False))
+
+
+def phone_app(res, standalone=False):
+    hub = hub_get(res)
+    custs = demo_customers(hub["hist"], res["ds"])
+    if not custs:
+        st.caption("Không có khách hàng mẫu.")
+        return
+    st.session_state.setdefault("ph_cust", custs[0])
+    prof = cust_profile(hub, st.session_state.ph_cust)
+    st.session_state.setdefault("ph_amt", int(round(prof["avg"] / 1000) * 1000))
+    st.session_state.setdefault("ph_mer", hub["merch"].merchant_id.iloc[0])
+    for k, v in [("ph_dev", "Máy quen của tôi"), ("ph_place", "Nơi ở"), ("ph_ip", "VN"), ("ph_otp", "Đúng")]:
+        st.session_state.setdefault(k, v)
+    with card("phone"):
+        H('<div class="fs ph-top"><div><div class="b">FS Pay</div><div class="s">Ứng dụng thanh toán mô phỏng</div></div>'
+          f'<div class="s">📱 {e(st.session_state.ph_cust)}</div></div>')
+        st.selectbox("Tài khoản", custs, key="ph_cust",
+                     format_func=lambda c: f"{c} · {PROV_VN.get(cust_profile(hub, c)['home'], '')}",
+                     on_change=lambda: st.session_state.pop("ph_newdev", None))
+        ms = hub["merch"]
+        st.selectbox("Thanh toán cho", ms.merchant_id.tolist(), key="ph_mer",
+                     format_func=lambda m: f"{m} · {ms.set_index('merchant_id').merchant_category.get(m, '')}"
+                                           f"{' · rủi ro cao' if ms.set_index('merchant_id').merchant_risk_level.get(m) == 'HIGH' else ''}")
+        st.number_input("Số tiền (VND)", min_value=10000, step=50000, key="ph_amt",
+                        help=f"Mức thường của tài khoản này khoảng {money(prof['avg'])}")
+        with st.expander("Bối cảnh giả lập (thiết bị, nơi, mạng, OTP)", expanded=not standalone):
+            c = st.columns(2)
+            c[0].selectbox("Thiết bị", ["Máy quen của tôi", "Máy lạ"], key="ph_dev",
+                           on_change=lambda: st.session_state.pop("ph_newdev", None))
+            c[1].selectbox("Nơi giao dịch", ["Nơi ở", "Tỉnh khác"], key="ph_place")
+            c = st.columns(2)
+            c[0].selectbox("Mạng (IP)", list(IP_VN), key="ph_ip", format_func=lambda x: IP_VN[x])
+            c[1].selectbox("OTP", ["Đúng", "Sai 2 lần rồi đúng"], key="ph_otp")
+        H('<div class="fs-sub" style="margin:4px 0 2px">Điền nhanh kịch bản</div>')
+        c = st.columns(2)
+        for i, nm in enumerate(PRESETS):
+            c[i % 2].button(nm, key=f"pre_{i}", width="stretch", on_click=_set_preset, args=(nm, hub))
+        st.button("Thanh toán", icon=":material/send:", type="primary", width="stretch", key="ph_pay",
+                  on_click=phone_submit, args=(hub, res))
+        ev = hub["by_id"].get(st.session_state.get("ph_last"))
+        waiting = ev is not None and (ev["status"].startswith("Tạm giữ") or ev["status"].startswith("Chờ khách"))
+        st.fragment(phone_result, run_every=1.0 if waiting else None)(hub)
+
+
+# ---------------------------------------------------------------- màn hình giám sát
+def monitor_body(res):
+    hub = hub_get(res)
+    hub_tick(hub)
+    with hub["lock"]:
+        evs = list(hub["events"])
+        clock, speed, left = hub["clock"], hub["speed"], len(hub["rows"]) - hub["i"]
+    lv = pd.Series([x["level"] for x in evs]).value_counts() if evs else pd.Series(dtype=int)
+    ms = [x["ms"] for x in evs[-200:]] or [0.0]
+    on = speed > 0 and left > 0
+    n_pend = len(pending_events(hub))
+    H(f'<div class="fs lv-strip"><span class="lv-on {"" if on else "off"}"><i></i>{"ĐANG HOẠT ĐỘNG" if on else "TẠM DỪNG NỀN"}</span>'
+      f'<span class="lv-clock">Đồng hồ luồng<br><b>{clock:%d/%m/%Y %H:%M:%S}</b></span><div class="lv-cnt">'
+      f'<div><b>{n0(len(evs))}</b><span>đã chấm</span></div>'
+      f'<div><b style="color:#FF8787">{n0(lv.get("CRITICAL", 0) + lv.get("HIGH", 0))}</b><span>tạm giữ</span></div>'
+      f'<div><b style="color:#FFD43B">{n0(lv.get("MEDIUM", 0))}</b><span>xác thực thêm</span></div>'
+      f'<div><b style="color:#8CE99A">{n0(lv.get("LOW", 0))}</b><span>cho qua</span></div>'
+      f'<div><b>{d(float(np.mean(ms)), 2)}</b><span>ms / giao dịch</span></div>'
+      f'<div><b style="color:#FFA8A8">{n0(n_pend)}</b><span>chờ quyết định</span></div></div></div>')
+    c1, c2 = st.columns([1.15, 1], gap="medium")
+    with c1, card("mon_chart"):
+        title("Điểm rủi ro của các giao dịch vừa đến",
+              f"Trên đường đỏ: tạm giữ · giữa hai đường: xác thực thêm · ★ giao dịch từ điện thoại khách")
+        last = evs[-90:]
+        fig = go.Figure()
+        if last:
+            fig.add_scatter(x=[x["id"] for x in last], y=[x["score"] for x in last], mode="lines",
+                            line=dict(color="#CBD5E1", width=1), hoverinfo="skip")
+            for lvl in LEVELS:
+                pts = [x for x in last if x["level"] == lvl]
+                if pts:
+                    fig.add_scatter(x=[x["id"] for x in pts], y=[x["score"] for x in pts], mode="markers", name=lvl,
+                                    marker=dict(color=LEVEL_COLOR[lvl], size=[16 if x["src"] != "Dữ liệu BTC" else 9 for x in pts],
+                                                symbol=["star" if x["src"] != "Dữ liệu BTC" else "circle" for x in pts],
+                                                line=dict(color="#fff", width=1)),
+                                    hovertext=[f'{x["tid"]} · {x["cust"]} · {money(x["amount"])}' for x in pts],
+                                    hovertemplate="%{hovertext}<br>điểm %{y:.3f}<extra></extra>")
+        m = hub["model"]
+        fig.add_hline(y=m.thr, line=dict(color=LEVEL_COLOR["CRITICAL"], dash="dash", width=1.5))
+        fig.add_hline(y=m.med, line=dict(color="#A06A00", dash="dot", width=1.5))
+        style(fig, 300, legend=False)
+        fig.update_yaxes(range=[0, 1.05], dtick=0.2)
+        fig.update_xaxes(showticklabels=False, title=None)
+        chart(fig, "mon_fig")
+    with c2, card("mon_pending"):
+        title("Cần xử lý ngay", "Chặn = từ chối · Huỷ = huỷ và hoàn tiền · Xác thực = đã xác minh với khách, cho qua · "
+              "SLA: CRITICAL 5 phút, HIGH 2 giờ")
+        pending_panel(hub, res, "mon", limit=3)
+    with card("mon_feed"):
+        title("Giao dịch đang đến", "Mới nhất ở trên")
+        now = time.time()
+        items = []
+        for x in evs[-10:][::-1]:
+            src = '<span class="lv-src">📱 Điện thoại khách</span>' if x["src"] != "Dữ liệu BTC" else ""
+            items.append(f'<div class="lv-it {"new" if now - x["wall"] < 2.5 else ""}" style="--c:{LEVEL_COLOR[x["level"]]}">'
+                         f'<span class="t">{x["dt"]:%H:%M:%S}</span><span class="m"><b>{e(x["cust"])}</b> → {e(x["merchant"])} '
+                         f'{e(x["cat"])} · {e(PROV_VN.get(x["loc"], x["loc"]))} · IP {e(x["ip"])}{src}</span>'
+                         f'<span class="r"><b>{money(x["amount"])}</b> {badge(x["level"])}'
+                         f'<span class="act">{e(x["status"])}</span></span></div>')
+        H('<div class="fs lv-feed">' + ("".join(items) or '<div class="fs-sub">Chưa có giao dịch.</div>') + "</div>")
 
 
 def page_live(res):
-    L = st.session_state.get("live")
-    if L is None or L.get("rid") != res["rid"]:
-        with st.spinner("Đang dựng bảng trạng thái từ lịch sử giao dịch…"):
-            live_init(res)
-        L = st.session_state.live
-    m = L["model"]
-    with card("live_head"):
-        title("Giả lập luồng giao dịch thời gian thực",
-              f"Mô hình học trên {e(m.info.get('train') or 'toàn bộ nhãn')}; luồng phát {n0(len(L['rows']))} giao dịch "
-              f"{e(m.info.get('test') or '')} mà mô hình chưa từng thấy · đã nạp {n0(L['n_hist'])} giao dịch lịch sử vào bảng "
-              f"trạng thái · ngưỡng chặn {d(m.thr, 4)} · ngưỡng xác thực thêm {d(m.med, 4)}")
-        c = st.columns([2.2, 0.9, 0.9, 0.9], vertical_alignment="bottom")
-        c[0].segmented_control("Tốc độ", list(SPEEDS), default="2 GD/giây", key="live_speed")
-        running = L["running"]
-        if c[1].button("Tạm dừng" if running else ("Tiếp tục" if L["i"] else "Bắt đầu"),
-                       icon=":material/pause:" if running else ":material/play_arrow:", type="primary", width="stretch",
-                       key="live_run", disabled=L["i"] >= len(L["rows"])):
-            L["running"] = not running
-            st.rerun()
-        if c[2].button("+1 giao dịch", icon=":material/skip_next:", width="stretch", key="live_one",
-                       disabled=running or L["i"] >= len(L["rows"])):
-            live_step(L, 1)
-        if c[3].button("Làm lại", icon=":material/restart_alt:", width="stretch", key="live_reset"):
-            live_init(res)
-            st.rerun()
-    st.fragment(live_body, run_every=1.0 if L["running"] else None)()
-    with card("live_parity"):
-        title("Kiểm tra trùng khớp lô – luồng",
-              f"Cho toàn bộ {n0(len(res['df']))} giao dịch đi qua bộ chấm luồng từng giao dịch một và đối chiếu với chấm theo lô "
-              "bằng cùng một mô hình đóng băng")
+    H(re.sub(r"\s*\n\s*", " ", LIVE_CSS))
+    hub = hub_get(res)
+    m = hub["model"]
+    c = st.columns([2.3, 1.1, 1.3], vertical_alignment="center")
+    c[0].markdown(f"**Trung tâm giám sát thời gian thực** · mô hình học trên {m.info.get('train') or 'toàn bộ nhãn'}, "
+                  f"chấm từng giao dịch ngay khi đến · ngưỡng tạm giữ {d(m.thr, 2)}, xác thực thêm {d(m.med, 2)}")
+    cur = next((k for k, v in BG_SPEEDS.items() if v == hub["speed"]), "1 GD/giây")
+    sp = c[1].segmented_control("Giao dịch nền", list(BG_SPEEDS), default=cur, key="bg_speed",
+                                label_visibility="collapsed")
+    if sp is not None and BG_SPEEDS[sp] != hub["speed"]:
+        with hub["lock"]:
+            hub["speed"] = BG_SPEEDS[sp]; hub["last_tick"] = time.time()
+    c[2].markdown('<a href="?view=khach" target="_blank">📱 Mở điện thoại khách trên máy khác</a>', unsafe_allow_html=True)
+    left, right = st.columns([0.82, 2.18], gap="medium")
+    with left:
+        phone_app(res)
+    with right:
+        st.fragment(monitor_body, run_every=1.0)(res)
+    with st.expander("Bằng chứng kỹ thuật: kiểm tra trùng khớp chấm theo luồng và chấm theo lô", icon=":material/fact_check:"):
         par = st.session_state.setdefault("parity", {})
-        if st.button("Chạy kiểm tra trùng khớp", icon=":material/fact_check:", key="btn_parity",
-                     type="secondary" if res["rid"] in par else "primary"):
+        st.caption(f"Cho toàn bộ {n0(len(res['df']))} giao dịch đi qua bộ chấm luồng từng giao dịch một và đối chiếu với chấm "
+                   "theo lô bằng cùng một mô hình đóng băng (khoảng 10 giây).")
+        if st.button("Chạy kiểm tra trùng khớp", icon=":material/fact_check:", key="btn_parity"):
             bar = st.progress(0.0, text="Đang chạy từng giao dịch…")
             par[res["rid"]] = RT.parity_check(res["model"], res["tables"],
                                               progress=lambda x: bar.progress(min(1.0, x), text="Đang chạy từng giao dịch…"))
             bar.empty()
         if res["rid"] in par:
             parity_view(par[res["rid"]])
+
+
+def page_customer(res):
+    """Giao diện riêng cho điện thoại khách: mở link ?view=khach."""
+    H(re.sub(r"\s*\n\s*", " ", LIVE_CSS))
+    H('<style>section[data-testid="stSidebar"],header[data-testid="stHeader"]{display:none}'
+      '.block-container,[data-testid="stMainBlockContainer"]{max-width:460px!important;padding-top:.6rem}</style>')
+    phone_app(res, standalone=True)
+    st.caption("Ứng dụng thanh toán mô phỏng phục vụ trình diễn Fraud Shield – không phải ứng dụng của ngân hàng thật.")
 
 
 # ============================================================================= 5. DỮ LIỆU & CHẠY MÔ HÌNH
@@ -1983,6 +2256,9 @@ if "res" not in st.session_state and "failed" not in st.session_state and "tried
     st.session_state.tried_sample = True
     auto_load_sample()
 RES = st.session_state.get("res")
+if st.query_params.get("view") == "khach" and RES is not None:
+    page_customer(RES)
+    st.stop()
 cur = sidebar(RES)
 if RES is None and cur != "data":
     cur = "data"
