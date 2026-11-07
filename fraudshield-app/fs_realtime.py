@@ -89,7 +89,7 @@ def to_percentile(raw, ref):
 
 # ============================================================================ Mô hình đóng băng
 class FrozenModel:
-    def __init__(self, lr_pipe, rule_w, iso, ref, thr, med, nov_thr, name, info=None):
+    def __init__(self, lr_pipe, rule_w, iso, ref, thr, med, nov_thr, name, info=None, ctx_ref=None, ctx_thr=None):
         sc, clf = lr_pipe.named_steps["standardscaler"], lr_pipe.named_steps["logisticregression"]
         self.lr = lr_pipe
         self.mean, self.scale = sc.mean_.copy(), sc.scale_.copy()
@@ -102,6 +102,9 @@ class FrozenModel:
         self.w = F.W_FUSION
         self.name = name
         self.info = info or {}
+        # Lớp ngữ cảnh (v3.2): bảng tham chiếu giai đoạn quá khứ + ngưỡng cửa vào tầng xác thực thêm
+        self.ctx_ref = ctx_ref
+        self.ctx_thr = float("inf") if ctx_thr is None else float(ctx_thr)
 
     # ---------- chấm theo lô (dùng scikit-learn) – để đối chiếu
     def score_frame(self, df):
@@ -110,9 +113,18 @@ class FrozenModel:
         rule = F.noisy_or(df[list(F.RULE_W)].astype(int), self.rule_w)
         an = to_percentile(-self.iso.score_samples(X), self.ref)
         s = np.clip(self.w[0] * ml + self.w[1] * rule + self.w[2] * an, 0, 1)
+        cx = F.ctx_score(F.ctx_matrix(df), self.ctx_ref) if self.ctx_ref is not None else np.zeros(len(df))
         return pd.DataFrame({"transaction_id": df.transaction_id.values, "ml_score": ml, "rule_score": rule,
-                             "anomaly_score": an, "risk_score": s,
-                             "risk_level": level(s, df.flag_R5.values, df.flag_R6.values, self.thr, self.med)})
+                             "anomaly_score": an, "risk_score": s, "ctx_score": cx,
+                             "risk_level": level(s, df.flag_R5.values, df.flag_R6.values, self.thr, self.med,
+                                                 cx, self.ctx_thr)})
+
+    def ctx_one(self, f):
+        """Điểm lớp ngữ cảnh của 1 giao dịch + độ hiếm từng đặc trưng (để viết lý do)."""
+        if self.ctx_ref is None:
+            return 0.0, None
+        v = F.ctx_vector(f)[None, :]
+        return float(F.ctx_score(v, self.ctx_ref)[0]), F.ctx_parts(v, self.ctx_ref)[0]
 
     # ---------- chấm 1 giao dịch (numpy thuần)
     def score_vec(self, x, flags):
@@ -128,10 +140,13 @@ class FrozenModel:
         return ml, rule, an, s
 
 
-def level(s, r5, r6, thr, med):
+def level(s, r5, r6, thr, med, ctx=None, ctx_thr=None):
+    """Mức rủi ro. Lớp ngữ cảnh chỉ nâng LOW lên MEDIUM (xác thực thêm), không bao giờ tự chặn."""
     s = np.asarray(s)
     crit = (np.asarray(r5) == 1) | (np.asarray(r6) == 1)
     lv = np.where(s >= thr, "HIGH", np.where(s >= med, "MEDIUM", "LOW"))
+    if ctx is not None and ctx_thr is not None:
+        lv = np.where((lv == "LOW") & (np.asarray(ctx) > ctx_thr), "MEDIUM", lv)
     return np.where((s >= thr) & crit, "CRITICAL", lv)
 
 
@@ -157,7 +172,8 @@ class OnlineScorer:
     def _state(self, cid):
         st = self.C.get(cid)
         if st is None:
-            st = {"win": deque(), "last": None, "n": 0, "s": 0.0, "ss": 0.0, "vals": [],
+            st = {"win": deque(), "last": None, "n": 0, "s": 0.0, "ss": 0.0, "vals": [], "amax": None,
+                  "hist_ts": deque(), "gaps": [],
                   "seen": {"device": set(), "location": set(), "channel": set(), "ip": set()}, "ipcnt": {}}
             self.C[cid] = st
         return st
@@ -196,6 +212,18 @@ class OnlineScorer:
         gap = max(0.0, ts - st["last"]) if st["last"] is not None else np.nan
         f["min_gap_s"] = gap
         f["log_min_gap"] = math.log1p(gap) if not pd.isna(gap) else math.log1p(1e7)
+        # Ngữ cảnh của chính khách (v3.2) – cùng định nghĩa với F.build
+        n_prev = st["n"]
+        f["c_amt_over_max"] = math.log(amount / st["amax"]) if n_prev >= 3 else 0.0
+        ht = st["hist_ts"]
+        while ht and ht[0] < ts - 3600:
+            ht.popleft()
+        f["c_n_1h"] = float(len(ht))
+        if n_prev >= 4:
+            gs = st["gaps"]
+            f["c_gap_pct"] = float(np.mean(np.asarray(gs) > gap))
+        else:
+            f["c_gap_pct"] = 0.5
         keys = {"device": did, "location": t["location"], "channel": t["payment_channel"], "ip": t["ip_country"]}
         for nm, v in keys.items():
             f[f"prof_new_{nm}"] = int(v not in st["seen"][nm])
@@ -222,6 +250,10 @@ class OnlineScorer:
         f["dev_shared"] = int(f["dev_n_cust_sofar"] >= 2)
         if update:
             win.append((ts, fail))
+            if st["last"] is not None:
+                st["gaps"].append(gap)
+            ht.append(ts)
+            st["amax"] = amount if st["amax"] is None else max(st["amax"], amount)
             st["last"] = ts
             for nm, v in keys.items():
                 st["seen"][nm].add(v)
@@ -252,11 +284,15 @@ class OnlineScorer:
         fl = self.flags(f)
         x = np.array([0.0 if pd.isna(f[c]) else float(f[c]) for c in F.FEATURES])
         ml, rule, an, s = self.m.score_vec(x, fl)
-        lv = level([s], [fl["flag_R5"]], [fl["flag_R6"]], self.m.thr, self.m.med)[0]
+        cx, cparts = self.m.ctx_one(f) if hasattr(self.m, "ctx_one") else (0.0, None)
+        lv = level([s], [fl["flag_R5"]], [fl["flag_R6"]], self.m.thr, self.m.med, [cx],
+                   getattr(self.m, "ctx_thr", None))[0]
+        door = bool(lv == "MEDIUM" and s < self.m.med)
         nov = bool(lv == "LOW" and an >= self.m.nov_thr)
         ms = (time.perf_counter() - t0) * 1000
         out = {"transaction_id": t["transaction_id"], "risk_score": s, "ml_score": ml, "rule_score": rule,
-               "anomaly_score": an, "risk_level": lv, "action": ACTIONS[lv], "novelty": nov, "latency_ms": ms}
+               "anomaly_score": an, "ctx_score": cx, "ctx_door": door,
+               "risk_level": lv, "action": ACTIONS[lv], "novelty": nov, "latency_ms": ms}
         if with_reason:
             r = SimpleNamespace(**{**t, **f, **fl})
             k = self.cust.get(t["customer_id"], {})
@@ -264,6 +300,10 @@ class OnlineScorer:
             mm = self.merch.get(t["merchant_id"], {})
             r.merchant_category = mm.get("merchant_category")
             out["alert_reason"] = F.reason(r)
+            if door and cparts is not None:
+                note = F.ctx_note(cparts, f)
+                a = out["alert_reason"]
+                out["alert_reason"] = note + "." if a.startswith("Không có") else note + ". " + a
         out["flags"] = fl
         out["features"] = f
         self.n_scored += 1
@@ -294,7 +334,7 @@ def parity_check(model, tables, df_batch=None, progress=None):
     t0 = time.perf_counter()
     for i, t in enumerate(rows):
         r = sc.score(t, with_reason=False)
-        out.append((r["transaction_id"], r["risk_score"], r["risk_level"]))
+        out.append((r["transaction_id"], r["risk_score"], r["risk_level"], r.get("ctx_score", 0.0)))
         lat.append(r["latency_ms"])
         fb = feats_b.loc[r["transaction_id"]].fillna(0).values.astype(float)
         fs = np.array([0.0 if pd.isna(r["features"][c]) else float(r["features"][c]) for c in F.FEATURES])
@@ -302,12 +342,13 @@ def parity_check(model, tables, df_batch=None, progress=None):
         if progress and i % 500 == 0:
             progress(i / len(rows))
     total = time.perf_counter() - t0
-    s = pd.DataFrame(out, columns=["transaction_id", "risk_stream", "level_stream"]).set_index("transaction_id")
+    s = pd.DataFrame(out, columns=["transaction_id", "risk_stream", "level_stream", "ctx_stream"]).set_index("transaction_id")
     j = batch.join(s)
     diff = (j.risk_score - j.risk_stream).abs()
     lat = np.array(lat)
     return {"n": int(len(j)), "max_abs_diff": float(diff.max()), "n_score_mismatch": int((diff > 1e-9).sum()),
             "n_level_mismatch": int((j.risk_level != j.level_stream).sum()), "max_feature_diff": fdiff,
+            "n_ctx_mismatch": int(((j.ctx_score - j.ctx_stream).abs() > 1e-9).sum()),
             "latency_mean_ms": float(lat.mean()), "latency_p95_ms": float(np.percentile(lat, 95)),
             "latency_p99_ms": float(np.percentile(lat, 99)), "latency_max_ms": float(lat.max()),
             "total_s": float(total), "model": model.name}

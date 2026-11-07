@@ -6,7 +6,7 @@ Chạy trên máy:   streamlit run streamlit_app.py
 Triển khai:      Streamlit Community Cloud – chọn tệp chính là streamlit_app.py
 Lõi mô hình:     fraud_core.py (giống hệt pipeline trong hồ sơ dự thi)
 
-Phiên bản v3.1 – 6 màn hình: Hàng đợi của tôi · Luồng thời gian thực · Tổng quan · Giao dịch · Kiểm định ·
+Phiên bản v3.2 (thêm lớp bất thường theo ngữ cảnh) – 6 màn hình: Hàng đợi của tôi · Luồng thời gian thực · Tổng quan · Giao dịch · Kiểm định ·
 Dữ liệu & Quản trị. Chấm điểm thời gian thực: fs_realtime.py (trùng 100% với chấm theo lô).
 """
 import hashlib
@@ -477,7 +477,7 @@ def store_result(res, files, notes, source, label=None):
 def start_run(files, notes, source):
     with st.status("Đang chạy Fraud Shield…", expanded=True) as s:
         st.write("Kiểm tra cấu trúc tệp, đối chiếu manifest và SHA-256")
-        st.write("Dựng hồ sơ hành vi, chấm điểm Rule – Logistic Regression – Isolation Forest")
+        st.write("Dựng hồ sơ hành vi, chấm điểm Rule – Logistic Regression – Isolation Forest, lớp ngữ cảnh")
         st.write("Huấn luyện/đánh giá 5-fold (nếu có nhãn), 3 tầng hành động, thí nghiệm ẩn từng kiểu, gom hồ sơ")
         try:
             res = engine(files)
@@ -1006,6 +1006,12 @@ def tx_detail(res, tid):
         fig.update_xaxes(range=[0, 1], dtick=0.1)
         fig.update_yaxes(visible=False)
         chart(fig, f"sc_{tid}")
+        cl = (res["report"].get("context_layer") or {}) if isinstance(res, dict) else {}
+        if "ctx_score" in r.index and cl.get("threshold") is not None:
+            on = int(r.get("ctx_door", 0)) == 1
+            H(f'<div class="fs fs-sub" style="margin:2px 0 6px">Lớp ngữ cảnh (lệch so với thói quen của chính khách): '
+              f'<b>{d(r.ctx_score, 1)}</b> / ngưỡng {d(cl["threshold"], 1)}'
+              + (' → <b style="color:#A06A00">đưa sang xác thực thêm dù điểm rủi ro còn thấp</b>' if on else "") + "</div>")
         H('<div class="fs" style="margin-top:4px">' + "".join(
             f'<span class="fs-flag {"on" if r[k] else "off"}">{"●" if r[k] else "○"} {e(F.RULE_NAMES[k])}</span>'
             for k in F.RULE_W) + "</div>")
@@ -1405,6 +1411,8 @@ def eval_tiers(res):
               "(ngưỡng lồng) – con số dưới đây là kết quả ngoài mẫu")
         rows = [{"m": "Recall can thiệp (chặn hoặc xác thực thêm)", "v": f'{pct(k["intervene_recall"])} ({k["intervene_tp"]}/{k["n_fraud"]})',
                  "c": f'{k["stepup_legit"]} khách thật ({pct(k["stepup_legit_rate"], 2)}) phải xác thực thêm'},
+                {"m": "· trong đó nhờ lớp ngữ cảnh", "v": f'{k.get("ctx_tp", 0)} ca',
+                 "c": f'đổi lại {k.get("ctx_legit", 0)} khách thật bị hỏi thêm vì lệch mạnh so với thói quen'},
                 {"m": "Giá trị tiền gian lận bị chặn", "v": pct(k["value_recall_hard"]),
                  "c": f'{pct(k["value_recall_intervene"])} nếu tính cả xác thực thêm; ca sót lớn nhất '
                       f'{money_short(k["missed_value_top"][0]) if k["missed_value_top"] else "–"}'},
@@ -1420,7 +1428,8 @@ def eval_tiers(res):
         st.caption(f"Ngưỡng xác thực thêm đặt để Recall can thiệp trên dữ liệu học ≥ {pct(k['target_intervene'], 0)} "
                    f"(biên an toàn để ngoài mẫu ≥ 90%), nhưng không quá {pct(k['stepup_cap'], 0)} khách thật phải xác thực "
                    f"thêm. Ngưỡng chọn ở 5 fold: {', '.join(d(x, 3) for x in k['med_folds'])} · ngưỡng dùng chung: "
-                   f"{d(rep['medium_threshold'], 4)}.")
+                   f"{d(rep['medium_threshold'], 4)}. Lớp ngữ cảnh mở thêm một cửa vào tầng xác thực thêm, ngân sách "
+                   f"~{pct(F.CTX_BUDGET, 0)} giao dịch thật.")
     with c2, card("ev_tiers_type"):
         title("Theo nhóm gian lận", "Số ca bị chặn và số ca được can thiệp (chặn hoặc xác thực thêm)")
         cnt = {t: v for t, v in rep["labeled_counts"].items() if t not in ("NORMAL",)}
@@ -1455,19 +1464,66 @@ def eval_loto(rep):
     with card("ev_loto"):
         title("Thí nghiệm ẩn từng kiểu gian lận",
               "Coi mỗi kiểu là một thủ đoạn mô hình chưa từng gặp: bỏ toàn bộ nhãn của kiểu đó khỏi dữ liệu học và tắt luật "
-              "tương ứng, học lại hồi quy logistic và trọng số luật trên phần còn lại; Isolation Forest giữ nguyên (không dùng "
-              "nhãn); giữ nguyên ngưỡng hiện hành; đếm số ca của kiểu bị ẩn mà hệ thống vẫn can thiệp")
+              "tương ứng, học lại hồi quy logistic và trọng số luật trên phần còn lại; Isolation Forest và lớp ngữ cảnh giữ "
+              "nguyên (không dùng nhãn gian lận); giữ nguyên ngưỡng hiện hành; đếm số ca của kiểu bị ẩn mà hệ thống vẫn can thiệp")
+        has_ctx = "medium_plus_base" in tot
         rows = [{"t": FRAUD_VN.get(o["type"], o["type"]) if o["type"] != "TỔNG" else "Tổng", "r": o["rules_off"],
                  "n": o["n"], "h": f'{o["high"]} ({pct(o["high"] / o["n"], 0)})',
-                 "m": f'{o["medium_plus"]} ({pct(o["medium_plus"] / o["n"], 0)})', "q": o["queue"]} for o in lo]
-        table(rows, [("t", "Kiểu bị ẩn"), ("r", "Luật bị tắt"), ("n", "Số ca"), ("h", "Bị chặn"),
-                     ("m", "Chặn hoặc xác thực thêm"), ("q", "Vào hàng đợi mẫu mới")],
-              num_cols=("n", "h", "m", "q"), hl_last=True)
-        H(f'<div class="fs fs-reason"><b>Kết luận:</b> với kiểu gian lận mô hình chưa từng học, hệ thống vẫn chặn '
-          f'{tot["high"]}/{tot["n"]} ca và can thiệp (chặn hoặc bắt xác thực thêm) {tot["medium_plus"]}/{tot["n"]} ca '
-          f'({pct(tot["medium_plus"] / tot["n"], 0)}), nhờ các dấu vết lệch thói quen chung. Điểm yếu: chuỗi giao dịch '
-          f'dồn dập khi tắt luật R6. Hàng đợi nghi vấn mẫu mới (Isolation Forest, giới hạn ~{F.NOV_BUDGET} ca/kỳ) chỉ thêm '
-          f'{tot["queue"]} ca – trên dữ liệu này dị biệt đơn thuần chưa phải tín hiệu mạnh.</div>')
+                 "b": f'{o.get("medium_plus_base", o["medium_plus"])} ({pct(o.get("medium_plus_base", o["medium_plus"]) / o["n"], 0)})',
+                 "m": f'{o["medium_plus"]} ({pct(o["medium_plus"] / o["n"], 0)})', "c": f'+{o.get("ctx_only", 0)}',
+                 "q": o["queue"]} for o in lo]
+        cols = [("t", "Kiểu bị ẩn"), ("r", "Luật bị tắt"), ("n", "Số ca"), ("h", "Bị chặn")]
+        cols += ([("b", "Can thiệp – chưa có lớp ngữ cảnh"), ("c", "Lớp ngữ cảnh bắt thêm"),
+                  ("m", "Can thiệp – bản v3.2")] if has_ctx else [("m", "Chặn hoặc xác thực thêm")])
+        cols += [("q", "Vào hàng đợi mẫu mới")]
+        table(rows, cols, num_cols=("n", "h", "b", "c", "m", "q"), hl_last=True)
+        if has_ctx:
+            H(f'<div class="fs fs-reason"><b>Kết luận:</b> với kiểu gian lận mô hình chưa từng học, hệ thống chặn '
+              f'{tot["high"]}/{tot["n"]} ca và can thiệp (chặn hoặc bắt xác thực thêm) {tot["medium_plus"]}/{tot["n"]} ca '
+              f'({pct(tot["medium_plus"] / tot["n"], 1)}). Trước khi có lớp ngữ cảnh con số này là '
+              f'{tot["medium_plus_base"]}/{tot["n"]} ({pct(tot["medium_plus_base"] / tot["n"], 1)}): lớp ngữ cảnh bắt thêm '
+              f'{tot["ctx_only"]} ca, chủ yếu ở kiểu số tiền đột biến, giao dịch dồn dập và merchant rủi ro – đúng ba kiểu '
+              f'trước đây yếu nhất. Phần chặn ngay không đổi vì lớp ngữ cảnh chỉ bắt xác thực thêm, không tự chặn.</div>')
+        else:
+            H(f'<div class="fs fs-reason"><b>Kết luận:</b> với kiểu gian lận mô hình chưa từng học, hệ thống vẫn chặn '
+              f'{tot["high"]}/{tot["n"]} ca và can thiệp {tot["medium_plus"]}/{tot["n"]} ca.</div>')
+    ctx = rep.get("context_layer") or {}
+    if has_ctx and ctx.get("tradeoff"):
+        c1, c2 = st.columns([1, 1.15], gap="medium")
+        with c1, card("ev_ctx_how"):
+            title("Lớp ngữ cảnh hoạt động thế nào", "Không dùng nhãn gian lận · chạy cả theo lô lẫn thời gian thực, "
+                  "cả hệ thống vẫn chấm mỗi giao dịch dưới 1 ms")
+            H('<div class="fs fs-sub" style="font-size:13.5px;color:#1F2937;line-height:1.65">'
+              '<b>1.</b> Với mỗi giao dịch, lấy 19 đặc trưng rủi ro, trong đó có 3 đặc trưng mới so với chính khách: '
+              'số tiền vượt mức cao nhất từng chi, số giao dịch trong 1 giờ trước đó, nhịp giao dịch nhanh hơn bao nhiêu '
+              'phần trăm các lần trước.<br><b>2.</b> So từng đặc trưng với phân bố của giai đoạn quá khứ <i>theo đúng chiều '
+              'rủi ro</i> (số tiền cao hơn, nhịp nhanh hơn, thiết bị mới hơn…), tính độ hiếm −log P(X ≥ x) rồi cộng lại '
+              '(dạng HBOS có chiều).<br><b>3.</b> Giao dịch có tổng độ hiếm vượt ngưỡng mà điểm rủi ro còn thấp được '
+              f'chuyển sang <b>xác thực thêm</b>. Ngưỡng đặt sao cho chỉ khoảng {pct(ctx.get("budget", F.CTX_BUDGET), 0)} '
+              'giao dịch thật bị hỏi thêm – chỉ dùng nhãn "bình thường", không dùng nhãn gian lận.<br>'
+              '<b>Vì sao không đưa thẳng vào hồi quy logistic?</b> Thử nghiệm cho thấy làm vậy mô hình có giám sát '
+              '"học thuộc" từng kiểu đã biết và bắt kiểu mới kém đi. Lớp riêng, không dùng nhãn, giữ được khả năng tổng quát.'
+              '<br><b>Đã thử nhưng không dùng:</b> LOF, One-Class SVM, Autoencoder (kém Isolation Forest trên dữ liệu này); '
+              'theo dõi đột biến theo merchant và gom "chiến dịch" (gian lận trong Data Pack rải rác, không thành đợt nên '
+              'không tăng được ca nào).</div>')
+        with c2, card("ev_ctx_trade"):
+            title("Đánh đổi theo ngân sách xác thực thêm",
+                  "Kiểm định lồng 5-fold (ngưỡng chọn trên phần huấn luyện) và thí nghiệm ẩn từng kiểu")
+            g = tot.get("grid") or {}
+            rows = []
+            for t in ctx["tradeoff"]:
+                q = t["budget"]
+                mp = g.get(q, g.get(str(q)))
+                rows.append({"b": "Không dùng" if q == 0 else f"~{pct(q, 0)} khách thật",
+                             "i": f'{pct(t["intervene_recall"], 1)} ({t["intervene_tp"]})',
+                             "s": pct(t["stepup_legit_rate"], 2),
+                             "l": f'{mp}/{tot["n"]} ({pct(mp / tot["n"], 1)})' if mp is not None else "–",
+                             "_hl": abs(q - ctx.get("budget", F.CTX_BUDGET)) < 1e-9})
+            hl = next((i for i, r in enumerate(rows) if r["_hl"]), None)
+            table(rows, [("b", "Ngân sách"), ("i", "Recall can thiệp"), ("s", "Khách thật bị hỏi thêm"),
+                         ("l", "Kiểu mới (ẩn từng kiểu)")], num_cols=("i", "s", "l"), hl_row=hl)
+            st.caption(f"Bản v3.2 chọn ~{pct(ctx.get('budget', F.CTX_BUDGET), 0)}: tổng số khách thật phải xác thực thêm vẫn "
+                       f"dưới giới hạn {pct(F.STEPUP_CAP, 0)} đã thống nhất. Tăng lên 5% gần như không bắt thêm được ca nào.")
 
 
 def eval_realtime(res):
@@ -1838,11 +1894,12 @@ def queue_live_box(hub, res):
 
 
 def parity_view(p):
-    ok = p["n_score_mismatch"] == 0 and p["n_level_mismatch"] == 0
+    ok = p["n_score_mismatch"] == 0 and p["n_level_mismatch"] == 0 and p.get("n_ctx_mismatch", 0) == 0
     H('<div class="fs fs-kgrid" style="margin:4px 0 6px">' + "".join([
         kcard(n0(p["n"]), "Giao dịch chạy qua luồng", BLUE, "từng giao dịch một, đúng thứ tự thời gian"),
         kcard(n0(p["n_score_mismatch"]), "Giao dịch lệch điểm", GREEN if ok else LEVEL_COLOR["CRITICAL"],
-              f"chênh lớn nhất {p['max_abs_diff']:.1e} · lệch mức: {p['n_level_mismatch']}",
+              f"chênh lớn nhất {p['max_abs_diff']:.1e} · lệch mức: {p['n_level_mismatch']}"
+              + (f" · lệch lớp ngữ cảnh: {p['n_ctx_mismatch']}" if "n_ctx_mismatch" in p else ""),
               "Trùng 100%" if ok else "Có lệch", "#E6F4EA" if ok else "#FFE3E3"),
         kcard(f"{d(p['latency_mean_ms'], 2)} ms", "Thời gian chấm 1 giao dịch", PURPLE,
               f"p95 {d(p['latency_p95_ms'], 2)} ms · p99 {d(p['latency_p99_ms'], 2)} ms"),
@@ -1873,7 +1930,8 @@ def monitor_body(res):
     c1, c2 = st.columns([1.15, 1], gap="medium")
     with c1, card("mon_chart"):
         title("Điểm rủi ro của các giao dịch vừa đến",
-              f"Mỗi điểm là một giao dịch từ ứng dụng khách · trên đường đỏ: tạm giữ · giữa hai đường: xác thực thêm")
+              f"Mỗi điểm là một giao dịch từ ứng dụng khách · trên đường đỏ: tạm giữ · giữa hai đường: xác thực thêm · "
+              f"điểm vàng dưới đường: lớp ngữ cảnh thấy lệch mạnh so với thói quen nên vẫn bắt xác thực thêm")
         last = evs[-90:]
         fig = go.Figure()
         if last:
@@ -2514,7 +2572,8 @@ def page_data(res):
                 st.caption("Chưa có dữ liệu.")
         with card("dt_run"):
             title("Chạy mô hình", "Hệ luật (R1–R7) + Hồi quy logistic + Isolation Forest (học trên giai đoạn quá khứ), "
-                  "gộp điểm 0,6 – 0,3 – 0,1, xếp 3 tầng hành động và gom hồ sơ")
+                  "gộp điểm 0,6 – 0,3 – 0,1, lớp ngữ cảnh (lệch so với thói quen của chính khách), xếp 3 tầng hành động "
+                  "và gom hồ sơ")
             if st.button("Chạy mô hình với dữ liệu tải lên" if ups else "Chạy mô hình với Data Pack BTC", type="primary",
                          icon=":material/play_arrow:", width="stretch", key="btn_run",
                          disabled=not ups and not (SAMPLE_DIR / "transactions.csv").exists()):

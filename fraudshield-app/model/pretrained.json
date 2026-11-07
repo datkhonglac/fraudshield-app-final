@@ -1,5 +1,5 @@
 {
- "version": "FraudShield-v3.1 (thời gian thực · 3 tầng hành động)",
+ "version": "FraudShield-v3.2 (thời gian thực · 3 tầng hành động · lớp ngữ cảnh)",
  "features": [
   "amt_ratio",
   "dev_not_registered_to_cust",
@@ -105,5 +105,7 @@
  "intercept": -2.2624243722320667,
  "n_labels": 2000,
  "n_fraud": 128,
+ "context_ref_q": 0.091081,
+ "context_budget": 0.03,
  "source": "Học trên 2.000 nhãn công khai của Data Pack BTC (snapshot 26/10/2026, chỉ dùng dữ liệu quá khứ)"
 }

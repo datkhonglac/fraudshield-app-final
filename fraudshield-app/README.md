@@ -1,20 +1,26 @@
-# Fraud Shield v3.1 – Web app Streamlit
+# Fraud Shield v3.2 – Web app Streamlit
 
 Bàn làm việc chống gian lận thanh toán số · Festival Chuyển đổi số 2026 · Bảng B · bản vòng Chung kết.
 Mọi đặc trưng chỉ dùng thông tin có trước hoặc tại thời điểm giao dịch; Isolation Forest và bảng phân vị
 tham chiếu chỉ học trên giai đoạn quá khứ (tháng 1–4).
 
+**Mới ở v3.2 – lớp bất thường theo ngữ cảnh** (không dùng nhãn gian lận): so từng đặc trưng rủi ro của giao dịch với
+giai đoạn quá khứ theo đúng chiều rủi ro, gồm 3 đặc trưng mới so với chính khách (vượt mức cao nhất từng chi, số giao
+dịch trong 1 giờ, nhịp nhanh hơn thường lệ), cộng độ hiếm −log P(X ≥ x) (dạng HBOS có chiều). Giao dịch lệch mạnh mà
+điểm rủi ro còn thấp được chuyển sang xác thực thêm (ngân sách ~3% giao dịch thật). Mục tiêu: bắt kiểu gian lận mô
+hình có giám sát chưa từng học.
+
 Kết quả trên Data Pack BTC (kiểm định 5-fold, ngưỡng lồng – số ngoài mẫu):
 
 | Chỉ số | Kết quả |
 |---|---|
-| Recall can thiệp (chặn hoặc xác thực thêm) | 91,4% (117/128) · 1,44% khách thật phải xác thực thêm |
-| Giá trị tiền gian lận bị chặn | 93,6% (98,1% nếu tính cả xác thực thêm) |
+| Recall can thiệp (chặn hoặc xác thực thêm) | 93,8% (120/128) · 3,74% khách thật phải xác thực thêm |
+| Giá trị tiền gian lận bị chặn | 93,6% (98,8% nếu tính cả xác thực thêm) |
 | Recall theo vụ tấn công | 85,7% (96/112 vụ) |
 | Recall chặn ngay (HIGH/CRITICAL) | 82,8% (106/128) · 10 báo nhầm / 1.872 · F1 0,869 · PR-AUC 0,934 |
 | Kiểm tra theo thời gian (học T1–4, thử T5–6) | F1 0,854 · can thiệp 86,4% |
-| Kiểu gian lận chưa từng học (ẩn từng kiểu) | chặn 76/128 · can thiệp 96/128 (75%) |
-| Chấm điểm thời gian thực | trùng 100% với chấm theo lô trên 8.000 giao dịch · ~0,4 ms/giao dịch |
+| Kiểu gian lận chưa từng học (ẩn từng kiểu) | chặn 76/128 · can thiệp **117/128 (91,4%)** – v3.1: 96/128 (75%) |
+| Chấm điểm thời gian thực | trùng 100% với chấm theo lô trên 8.000 giao dịch (cả lớp ngữ cảnh) · ~0,5 ms/giao dịch |
 
 ## Ứng dụng có gì (6 màn hình)
 

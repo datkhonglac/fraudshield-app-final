@@ -5,13 +5,17 @@ Festival Chuyển đổi số 2026 · Bảng B · Digital Payment Fraud Shield
 Nguyên tắc: mọi đặc trưng của một giao dịch chỉ dùng thông tin CÓ TRƯỚC hoặc TẠI thời điểm giao dịch
 (cửa sổ trượt lùi [t-5 phút, t], [t-30 phút, t]; hồ sơ hành vi chỉ từ các giao dịch trước đó).
 
-Ba lớp:
+Các lớp:
   1) Hồ sơ hành vi khách hàng (chỉ lịch sử quá khứ, không dùng nhãn)
   2) Chấm điểm 3 tầng: Rule (noisy-OR) + Logistic Regression + Isolation Forest
      risk_score = 0,60·ML + 0,30·Rule + 0,10·Anomaly
      Trọng số mỗi luật = cận dưới khoảng tin cậy Wilson 95% của tỉ lệ "luật bật thì đúng là gian lận",
      tính trên phần dữ liệu huấn luyện của từng fold.
-  3) Ngưỡng / risk_level / alert_reason / priority_rank / gom case
+  3) Lớp bất thường theo ngữ cảnh (v3.2, không dùng nhãn): mỗi đặc trưng rủi ro được so với phân bố của giai đoạn
+     quá khứ theo đúng chiều rủi ro (số tiền cao hơn, nhịp nhanh hơn, thiết bị mới hơn…), cộng độ hiếm
+     −log P(X ≥ x) của từng đặc trưng (dạng HBOS có chiều). Giao dịch lệch mạnh mà điểm tổng còn thấp được đưa
+     sang tầng "xác thực thêm" – cửa này dành cho kiểu gian lận mô hình có giám sát chưa từng thấy.
+  4) Ngưỡng / risk_level / alert_reason / priority_rank / gom case
 
 Hai chế độ:
   - "train": Data Pack có fraud_labels_sample.csv -> huấn luyện + đánh giá đầy đủ
@@ -19,7 +23,7 @@ Hai chế độ:
   - "score": Data Pack không có nhãn -> chấm điểm bằng mô hình đã huấn luyện sẵn
     (model/pretrained.joblib, học trên 2.000 nhãn công khai của BTC).
 """
-import hashlib, io, json, time, zipfile
+import hashlib, io, json, math, time, zipfile
 from pathlib import Path
 import numpy as np
 import pandas as pd
@@ -32,7 +36,7 @@ from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 
 SEED = 42
-VERSION = "FraudShield-v3.1 (thời gian thực · 3 tầng hành động)"
+VERSION = "FraudShield-v3.2 (thời gian thực · 3 tầng hành động · lớp ngữ cảnh)"
 W_FUSION = (0.60, 0.30, 0.10)
 # Trọng số mặc định (Wilson 95% cận dưới trên 2.000 nhãn BTC); khi có nhãn sẽ được tính lại từ dữ liệu
 RULE_W = {"flag_R1_strong": .62, "flag_R1_mild": .24, "flag_R2": .84, "flag_R3": .92, "flag_R4": .30,
@@ -56,6 +60,15 @@ CASE_GAP_S = 1800
 TARGET_INTERVENE = 0.91   # Recall can thiệp đặt trên dữ liệu học (biên an toàn 1 điểm để ngoài mẫu ≥ 90%)
 STEPUP_CAP = 0.05         # tối đa 5% giao dịch thật phải xác thực thêm
 NOV_BUDGET = 40           # hàng đợi nghi vấn mẫu mới: khoảng 40 ca cho cả kỳ
+CTX_BUDGET = 0.03         # cửa ngữ cảnh: tối đa ~3% giao dịch thật bị đưa sang xác thực thêm vì lệch ngữ cảnh
+CTX_GRID = (0.0, 0.01, 0.02, 0.03, 0.05)
+# Lớp ngữ cảnh: (đặc trưng, chiều rủi ro). +1: càng cao càng rủi ro; -1: càng thấp càng rủi ro. Không dùng nhãn.
+CTX_SPEC = [("amt_ratio", 1), ("prof_amt_z", 1), ("c_amt_over_max", 1), ("n_txn_5m", 1), ("c_n_1h", 1),
+            ("c_gap_pct", 1), ("log_min_gap", -1), ("n_fail_30m", 1), ("merchant_high", 1),
+            ("dev_not_registered_to_cust", 1), ("dev_age_days", -1), ("loc_mismatch", 1), ("ip_foreign", 1),
+            ("auth_none", 1), ("dev_compromised", 1), ("dev_shared", 1), ("prof_new_device", 1),
+            ("prof_new_location", 1), ("prof_new_ip", 1)]
+CTX_FILL = {"dev_age_days": 9999.0}
 ACTIONS = {"CRITICAL": "Tạm dừng giao dịch, gọi xác minh ngay", "HIGH": "Tạm dừng, chuyên viên kiểm tra trong ca",
            "MEDIUM": "Yêu cầu xác thực thêm (OTP/sinh trắc học)", "LOW": "Cho qua"}
 COST_FN, COST_FP = 10, 1
@@ -254,6 +267,20 @@ def build(gd, kh, mc, tb):
     df["n_txn_5m"] = np.concatenate(n5); df["n_fail_30m"] = np.concatenate(f30)
     df["n_succ_30m"] = np.concatenate(s30)
     df["min_gap_s"] = np.concatenate(gap); df["log_min_gap"] = np.log1p(df.min_gap_s.fillna(1e7))
+    # Ngữ cảnh của chính khách (v3.2): so với các giao dịch TRƯỚC đó của cùng khách
+    a_over, n1h, gpct = [], [], []
+    for _, g in df.groupby("customer_id", sort=False):
+        ts = g.ts.values; am = g.amount.values.astype(float); k = len(ts)
+        cmax = np.maximum.accumulate(am); lo1 = np.searchsorted(ts, ts - 3600, "left"); gp = np.diff(ts)
+        a_ = np.zeros(k); c_ = np.full(k, 0.5)
+        for i in range(k):
+            if i >= 3:
+                a_[i] = math.log(am[i] / cmax[i - 1])            # >0: vượt mức cao nhất từng chi
+            if i >= 4:
+                c_[i] = float(np.mean(gp[:i - 1] > gp[i - 1]))  # tỉ lệ khoảng cách cũ dài hơn khoảng cách lần này
+        a_over.append(a_); n1h.append(np.arange(k) - lo1); gpct.append(c_)
+    df["c_amt_over_max"] = np.concatenate(a_over); df["c_n_1h"] = np.concatenate(n1h).astype(float)
+    df["c_gap_pct"] = np.concatenate(gpct)
     # Hồ sơ hành vi: chỉ từ các giao dịch trước đó của cùng khách
     for cot, ten in [("device_id", "device"), ("location", "location"), ("payment_channel", "channel"),
                      ("ip_country", "ip")]:
@@ -344,6 +371,104 @@ def reason(r):
     if not p:
         return "Không có tín hiệu bất thường nổi bật so với hồ sơ nền."
     return "; ".join(p[:3]) + "."
+
+
+# ============================================================================ 2b. LỚP NGỮ CẢNH (HBOS có chiều)
+def ctx_matrix(df):
+    """Ma trận đặc trưng ngữ cảnh đã nhân chiều rủi ro (càng lớn càng rủi ro)."""
+    # làm tròn 9 chữ số: chấm luồng tính trung bình/độ lệch chuẩn cộng dồn, có thể lệch 1e-16 so với chấm lô
+    return np.round(np.column_stack([sg * df[c].fillna(CTX_FILL.get(c, 0.0)).values.astype(float)
+                                     for c, sg in CTX_SPEC]), 9)
+
+
+def ctx_vector(f):
+    """Như ctx_matrix nhưng cho một giao dịch (dict đặc trưng) – dùng khi chấm luồng."""
+    out = []
+    for c, sg in CTX_SPEC:
+        v = f.get(c)
+        v = CTX_FILL.get(c, 0.0) if v is None or (isinstance(v, float) and math.isnan(v)) else float(v)
+        out.append(sg * v)
+    return np.round(np.array(out), 9)
+
+
+def ctx_fit(V, ref_mask):
+    """Bảng tham chiếu: giá trị đã sắp xếp của giai đoạn quá khứ + bảng độ hiếm −log((j+1)/(n+1)) dựng sẵn,
+    để chấm theo lô và chấm theo luồng cho ra đúng cùng một con số."""
+    refs = [np.sort(V[ref_mask, j]) for j in range(V.shape[1])]
+    n = int(ref_mask.sum())
+    table = np.array([-math.log((j + 1) / (n + 1)) for j in range(n + 1)])
+    return {"refs": refs, "n": n, "table": table, "cols": [c for c, _ in CTX_SPEC]}
+
+
+def ctx_parts(V, ref):
+    """Độ hiếm của từng đặc trưng: −log P_quá khứ(X ≥ x) (làm trơn +1)."""
+    V = np.atleast_2d(V)
+    P = np.empty(V.shape)
+    for j, r in enumerate(ref["refs"]):
+        tail = ref["n"] - np.searchsorted(r, V[:, j], side="left")      # số giá trị quá khứ ≥ x
+        P[:, j] = ref["table"][tail]
+    return P
+
+
+def ctx_score(V, ref):
+    P = ctx_parts(V, ref)
+    S = np.zeros(P.shape[0])
+    for j in range(P.shape[1]):
+        S = S + P[:, j]
+    return np.round(S, 9)
+
+
+CTX_TEXT = {"amt_ratio": lambda r: f"số tiền gấp {num(r['amt_ratio'])} lần mức nền",
+            "prof_amt_z": lambda r: f"số tiền lệch {num(r['prof_amt_z'])} độ lệch chuẩn so với thói quen",
+            "c_amt_over_max": lambda r: f"vượt mức cao nhất từng chi {num(math.exp(r['c_amt_over_max']))} lần",
+            "n_txn_5m": lambda r: f"giao dịch thứ {int(r['n_txn_5m'])} trong 5 phút",
+            "c_n_1h": lambda r: f"{int(r['c_n_1h'])} giao dịch khác trong 1 giờ trước đó",
+            "c_gap_pct": lambda r: f"nhịp nhanh hơn {num(100 * r['c_gap_pct'], 0)}% các lần trước của khách",
+            "log_min_gap": lambda r: f"chỉ cách giao dịch trước {_dur(math.expm1(r['log_min_gap']))}",
+            "n_fail_30m": lambda r: f"{int(r['n_fail_30m'])} lần thất bại trong 30 phút",
+            "merchant_high": lambda r: "merchant rủi ro nền HIGH",
+            "dev_not_registered_to_cust": lambda r: "thiết bị không đăng ký cho khách",
+            "dev_age_days": lambda r: "thiết bị mới xuất hiện",
+            "loc_mismatch": lambda r: "giao dịch ngoài tỉnh nơi ở", "ip_foreign": lambda r: "IP nước ngoài",
+            "auth_none": lambda r: "không xác thực", "dev_compromised": lambda r: "thiết bị có cờ rủi ro",
+            "dev_shared": lambda r: "thiết bị dùng chung nhiều khách",
+            "prof_new_device": lambda r: "lần đầu dùng thiết bị này",
+            "prof_new_location": lambda r: "lần đầu giao dịch ở tỉnh này",
+            "prof_new_ip": lambda r: "lần đầu dùng IP này"}
+
+
+def _dur(sec):
+    if sec < 120:
+        return f"{int(round(sec))} giây"
+    if sec < 7200:
+        return f"{int(round(sec / 60))} phút"
+    if sec < 172800:
+        return f"{num(sec / 3600, 0)} giờ"
+    return f"{num(sec / 86400, 0)} ngày"
+
+
+def ctx_note(parts, row, k=3):
+    """Câu giải thích: k đặc trưng hiếm nhất (so với giai đoạn quá khứ)."""
+    order = np.argsort(-parts)[:k]
+    bits = []
+    for j in order:
+        if parts[j] < 1.0:          # P ≥ ~37%: không đáng kể
+            continue
+        c = CTX_SPEC[j][0]
+        try:
+            bits.append(CTX_TEXT[c](row))
+        except Exception:  # noqa
+            bits.append(c)
+    return "Lệch mạnh so với thói quen (lớp ngữ cảnh): " + ", ".join(bits) if bits else "Lệch mạnh so với thói quen (lớp ngữ cảnh)"
+
+
+def ctx_door_thr(ctx, y, q=None):
+    """Ngưỡng cửa ngữ cảnh: phân vị (1−q) của điểm ngữ cảnh trên giao dịch THẬT – chỉ dùng nhãn 'bình thường',
+    không dùng nhãn gian lận, nên không 'học' kiểu gian lận nào."""
+    q = CTX_BUDGET if q is None else q
+    if q <= 0:
+        return float("inf")
+    return float(np.quantile(ctx[y == 0], 1 - q))
 
 
 # ============================================================================ 3. MÔ HÌNH + ĐÁNH GIÁ
@@ -440,14 +565,18 @@ def attack_ids(lab_fraud):
     return pd.Series(new.cumsum().values, index=a.index).reindex(lab_fraud.index)
 
 
-def evaluate_tiers(y, s, folds, lab):
-    """Đánh giá 3 tầng hành động bằng ngưỡng lồng (ngưỡng chọn trên phần huấn luyện của từng fold)."""
-    hard = np.zeros(len(y), dtype=bool); interv = np.zeros(len(y), dtype=bool)
+def evaluate_tiers(y, s, folds, lab, ctx=None, q=None):
+    """Đánh giá 3 tầng hành động bằng ngưỡng lồng (ngưỡng chọn trên phần huấn luyện của từng fold).
+    ctx: điểm lớp ngữ cảnh – cửa vào tầng xác thực thêm, ngưỡng chọn trên giao dịch thật của phần huấn luyện."""
+    hard = np.zeros(len(y), dtype=bool); interv = np.zeros(len(y), dtype=bool); door = np.zeros(len(y), dtype=bool)
     meds = []
     for tr, va in folds:
         t_thr = best_thr(y[tr], s[tr]); t_med = med_threshold(y[tr], s[tr], t_thr)
         meds.append(t_med)
         hard[va] = s[va] >= t_thr; interv[va] = s[va] >= t_med
+        if ctx is not None:
+            door[va] = (s[va] < t_med) & (ctx[va] > ctx_door_thr(ctx[tr], y[tr], q))
+    interv |= door
     fr, lg = y == 1, y == 0
     amt = lab.amount.values
     att = attack_ids(lab[fr])
@@ -463,8 +592,9 @@ def evaluate_tiers(y, s, folds, lab):
             "n_fraud": int(fr.sum()), "n_legit": int(lg.sum()), "med_folds": [round(m, 4) for m in meds],
             "intervene_by_type": pd.Series(interv[fr]).groupby(ft[fr]).sum().astype(int).to_dict(),
             "hard_by_type": pd.Series(hard[fr]).groupby(ft[fr]).sum().astype(int).to_dict(),
+            "ctx_tp": int(door[fr].sum()), "ctx_legit": int(door[lg].sum()), "ctx_legit_rate": float(door[lg].mean()),
             "missed_value_top": sorted([round(float(v)) for v in amt[fr & ~hard]], reverse=True)[:3],
-            "hard": hard, "interv": interv}
+            "hard": hard, "interv": interv, "door": door}
 
 
 def novelty_threshold(an, low, ref_mask, budget=None):
@@ -482,12 +612,14 @@ TYPE_RULES = {"FAILED_THEN_SUCCESS": ["flag_R5"], "VELOCITY_BURST": ["flag_R6"],
               "HIGH_RISK_MERCHANT": ["flag_R4"]}
 
 
-def leave_one_type_out(idx, y, ft, flags, X, an, thr, med, nov_thr):
+def leave_one_type_out(idx, y, ft, flags, X, an, thr, med, nov_thr, ctx=None, door_thr=None, grid=None):
     """Thí nghiệm ẩn từng kiểu gian lận (quy trình thống nhất của nhóm):
     - bỏ toàn bộ nhãn của kiểu đó khỏi dữ liệu học và tắt luật tương ứng;
     - học lại hồi quy logistic và trọng số luật trên phần nhãn còn lại; Isolation Forest giữ nguyên (không dùng nhãn);
-    - giữ nguyên ngưỡng hiện hành; đếm số ca của kiểu bị ẩn vượt HIGH, vượt MEDIUM, lọt vào hàng đợi mẫu mới."""
-    out = []
+    - giữ nguyên ngưỡng hiện hành; đếm số ca của kiểu bị ẩn vượt HIGH, vượt MEDIUM, lọt vào hàng đợi mẫu mới;
+    - lớp ngữ cảnh không dùng nhãn gian lận nên giữ nguyên; ngưỡng cửa chọn trên giao dịch thật.
+    grid: {q: ngưỡng cửa} – đếm thêm 'MEDIUM trở lên' theo từng ngân sách để vẽ bảng đánh đổi."""
+    out = []; gsum = {q: 0 for q in (grid or {})}
     for T in [t for t in pd.unique(ft) if t not in ("NORMAL",)]:
         tgt = ft == T
         if tgt.sum() < 5:
@@ -503,15 +635,21 @@ def leave_one_type_out(idx, y, ft, flags, X, an, thr, med, nov_thr):
         rule = noisy_or(fl, ww)
         s = W_FUSION[0] * ml + W_FUSION[1] * rule + W_FUSION[2] * an
         sT = s[idx[tgt]]
-        low = s < med
+        base_mp = sT >= med
+        dr = np.zeros(len(s), dtype=bool) if ctx is None or door_thr is None else (s < med) & (ctx > door_thr)
+        low = (s < med) & ~dr
         nov = low & (an >= nov_thr)
+        for q, dt in (grid or {}).items():
+            gsum[q] += int((base_mp | (ctx[idx[tgt]] > dt)).sum())
         out.append({"type": T, "rules_off": ", ".join(r.replace("flag_", "") for r in TYPE_RULES.get(T, [])) or "–",
-                    "n": int(tgt.sum()), "high": int((sT >= thr).sum()), "medium_plus": int((sT >= med).sum()),
+                    "n": int(tgt.sum()), "high": int((sT >= thr).sum()), "medium_plus": int((base_mp | dr[idx[tgt]]).sum()),
+                    "medium_plus_base": int(base_mp.sum()), "ctx_only": int((dr[idx[tgt]] & ~base_mp).sum()),
                     "queue": int(nov[idx[tgt]].sum()),
                     "queue_size": int(nov.sum())})
     tot = {"type": "TỔNG", "rules_off": "", "n": sum(o["n"] for o in out), "high": sum(o["high"] for o in out),
-           "medium_plus": sum(o["medium_plus"] for o in out), "queue": sum(o["queue"] for o in out),
-           "queue_size": None}
+           "medium_plus": sum(o["medium_plus"] for o in out), "medium_plus_base": sum(o["medium_plus_base"] for o in out),
+           "ctx_only": sum(o["ctx_only"] for o in out), "queue": sum(o["queue"] for o in out),
+           "queue_size": None, "grid": gsum}
     return out + [tot]
 
 
@@ -546,6 +684,12 @@ def run(files, tables=None, progress=lambda msg: None, pretrained_path=PRETRAINE
     ref_mask, ref_txt, live_txt, live_start = ref_period(df.datetime)
     iso, ref, an_all = fit_iso_ref(X_all, ref_mask)
     df["anomaly_score"] = an_all
+    progress("Đang chấm lớp ngữ cảnh (so với thói quen của chính khách, giai đoạn quá khứ)…")
+    V_all = ctx_matrix(df)
+    ctx_ref = ctx_fit(V_all, ref_mask)
+    ctx_all = ctx_score(V_all, ctx_ref)
+    df["ctx_score"] = ctx_all
+    ctx_info = None
     feat_ms = (time.perf_counter() - t0) * 1000
     w = W_FUSION
     lab_view = None
@@ -600,8 +744,15 @@ def run(files, tables=None, progress=lambda msg: None, pretrained_path=PRETRAINE
                 "fn": int(((~cp) & (y == 1)).sum()), "fp": int((cp & (y == 0)).sum()),
                 "detected_by_type": pd.Series(cp.astype(int)).groupby(ft).sum().astype(int).to_dict()}
         # 3 tầng hành động – đánh giá bằng ngưỡng lồng
-        tiers = evaluate_tiers(y, fused, folds, lab.assign(fraud_type=ft))
-        hard_pred, interv_pred = tiers.pop("hard"), tiers.pop("interv")
+        ctx_l = ctx_all[idx]
+        tiers = evaluate_tiers(y, fused, folds, lab.assign(fraud_type=ft), ctx=ctx_l)
+        hard_pred, interv_pred, door_pred = tiers.pop("hard"), tiers.pop("interv"), tiers.pop("door")
+        # Bảng đánh đổi: ngân sách cửa ngữ cảnh → bắt thêm bao nhiêu, bao nhiêu khách thật phải xác thực thêm
+        trade = []
+        for q in CTX_GRID:
+            tq = evaluate_tiers(y, fused, folds, lab.assign(fraud_type=ft), ctx=ctx_l, q=q)
+            trade.append({"budget": q, "intervene_tp": tq["intervene_tp"], "intervene_recall": round(tq["intervene_recall"], 4),
+                          "stepup_legit_rate": round(tq["stepup_legit_rate"], 4), "ctx_tp": tq["ctx_tp"]})
         # Hiệu quả từng luật (trên nhãn) + mức giảm PR-AUC khi bỏ luật
         per_rule = {}
         for c in RULE_W:
@@ -625,7 +776,9 @@ def run(files, tables=None, progress=lambda msg: None, pretrained_path=PRETRAINE
             thr_t = best_thr(y[trm], s_tr); med_t = med_threshold(y[trm], s_tr, thr_t)
             lr_t = lr().fit(Xl[trm], y[trm]); rw_t = rule_weights(FlB[trm], y[trm])
             s_te = w[0] * lr_t.predict_proba(Xl[tem])[:, 1] + w[1] * noisy_or(FlB[tem], rw_t) + w[2] * aB[tem]
-            pt = s_te >= thr_t; pm = s_te >= med_t
+            pt = s_te >= thr_t
+            dt_t = ctx_door_thr(ctx_l[trm], y[trm])
+            pm = (s_te >= med_t) | (ctx_l[tem] > dt_t)
             ye = y[tem]
             tsplit = {"train_months": ref_txt, "test_months": live_txt,
                       "n_train": int(trm.sum()), "fraud_train": int(y[trm].sum()), "n_test": int(tem.sum()),
@@ -636,13 +789,20 @@ def run(files, tables=None, progress=lambda msg: None, pretrained_path=PRETRAINE
                       "threshold": round(thr_t, 4), "medium_threshold": round(med_t, 4),
                       "intervene_recall": round(float(pm[ye == 1].mean()), 6),
                       "stepup_legit_rate": round(float((pm & ~pt)[ye == 0].mean()), 6)}
-            low_t = (w[0] * lr_t.predict_proba(X_all)[:, 1] + w[1] * noisy_or(flags_B, rw_t)
-                     + w[2] * df.anomaly_score.values) < med_t
+            low_t = ((w[0] * lr_t.predict_proba(X_all)[:, 1] + w[1] * noisy_or(flags_B, rw_t)
+                      + w[2] * df.anomaly_score.values) < med_t) & ~(ctx_all > dt_t)
             model_live = RT.FrozenModel(lr_t, rw_t, iso, ref, thr_t, med_t,
                                         novelty_threshold(df.anomaly_score.values, low_t, ref_mask),
                                         f"{VERSION} · học {ref_txt}",
-                                        {"train": ref_txt, "test": live_txt, "start": live_start})
+                                        {"train": ref_txt, "test": live_txt, "start": live_start},
+                                        ctx_ref=ctx_ref, ctx_thr=dt_t)
         THR = best_thr(y, fused); MED = med_threshold(y, fused, THR)
+        CTX_THR = ctx_door_thr(ctx_l, y)
+        ctx_grid = {q: ctx_door_thr(ctx_l, y, q) for q in CTX_GRID}
+        ctx_info = {"budget": CTX_BUDGET, "threshold": round(CTX_THR, 4),
+                    "ref_q": round(float((ctx_all[ref_mask] > CTX_THR).mean()), 6),
+                    "tradeoff": trade, "ctx_tp_nested": tiers["ctx_tp"], "ctx_legit_nested": tiers["ctx_legit"],
+                    "ctx_legit_rate_nested": round(tiers["ctx_legit_rate"], 4)}
         crit_l = ((FlB["flag_R5"] == 1) | (FlB["flag_R6"] == 1)).values
         L = np.where((fused >= THR) & crit_l, "CRITICAL", np.where(fused >= THR, "HIGH",
                                                                    np.where(fused >= MED, "MEDIUM", "LOW")))
@@ -684,7 +844,8 @@ def run(files, tables=None, progress=lambda msg: None, pretrained_path=PRETRAINE
                "n_attacks": tiers["n_attacks"], "n_fraud": tiers["n_fraud"], "n_legit": tiers["n_legit"],
                "med_folds": tiers["med_folds"], "missed_value_top": tiers["missed_value_top"],
                "intervene_by_type": tiers["intervene_by_type"], "hard_by_type": tiers["hard_by_type"],
-               "target_intervene": TARGET_INTERVENE, "stepup_cap": STEPUP_CAP}
+               "target_intervene": TARGET_INTERVENE, "stepup_cap": STEPUP_CAP,
+               "ctx_tp": tiers["ctx_tp"], "ctx_legit": tiers["ctx_legit"]}
         rep.update({"labeled_counts": {k: int(v) for k, v in counts.items()}, "comparison_nested_cv": comp,
                     "detected_by_type": per_type, "topk": topk, "cost_threshold": cost, "time_split": tsplit,
                     "per_rule": per_rule, "levels_labeled": levels_labeled, "fpr_by_segment_labeled": fpr_seg,
@@ -692,7 +853,8 @@ def run(files, tables=None, progress=lambda msg: None, pretrained_path=PRETRAINE
                     "false_negatives": labf[(labf.is_fraud == 1) & (labf.pred == 0)][err_cols].round(3).to_dict("records"),
                     "false_positives": labf[(labf.is_fraud == 0) & (labf.pred == 1)][err_cols].round(3).to_dict("records")})
         lab_view = pd.DataFrame({"transaction_id": lab.transaction_id.values, "y": y, "fraud_type": ft,
-                                 "score": np.round(fused, 5), "hard": hard_pred, "intervene": interv_pred})
+                                 "score": np.round(fused, 5), "hard": hard_pred, "intervene": interv_pred,
+                                 "ctx_door": door_pred})
         model_info = {"source": "Huấn luyện trên nhãn trong Data Pack vừa tải lên"
                                 + (f" + {n_extra} nhãn chuyên viên" if n_extra else ""),
                       "n_labels": int(len(y)), "n_fraud": int(y.sum())}
@@ -702,6 +864,8 @@ def run(files, tables=None, progress=lambda msg: None, pretrained_path=PRETRAINE
         progress("Không có nhãn – chấm điểm bằng mô hình đã huấn luyện sẵn…")
         pack = json.loads(Path(pretrained_path).read_text(encoding="utf-8"))
         THR = pack["threshold"]; MED = pack.get("medium_threshold", 0.6 * THR)
+        CTX_THR = float(np.quantile(ctx_all[ref_mask], 1 - pack.get("context_ref_q", 0.06)))
+        ctx_info = {"budget": CTX_BUDGET, "threshold": round(CTX_THR, 4), "ref_q": pack.get("context_ref_q", 0.06)}
         w_rules = pack.get("rule_weights", RULE_W)
         pipe_deploy = _pipe_from_pack(pack)
         ml_all = ml_full = pipe_deploy.predict_proba(X_all)[:, 1]
@@ -718,6 +882,9 @@ def run(files, tables=None, progress=lambda msg: None, pretrained_path=PRETRAINE
     crit = (df.flag_R5 == 1) | (df.flag_R6 == 1)
     lvl = np.where(df.risk_score >= THR, "HIGH", np.where(df.risk_score >= MED, "MEDIUM", "LOW"))
     df["risk_level"] = np.where((df.predicted_fraud == 1) & crit, "CRITICAL", lvl)
+    door = (df.risk_level == "LOW").values & (ctx_all > CTX_THR)
+    df["ctx_door"] = door.astype(int)
+    df.loc[door, "risk_level"] = "MEDIUM"
     df["action"] = df.risk_level.map(ACTIONS)
     low = (df.risk_level == "LOW").values
     nov_thr = novelty_threshold(df.anomaly_score.values, low, ref_mask)
@@ -725,6 +892,12 @@ def run(files, tables=None, progress=lambda msg: None, pretrained_path=PRETRAINE
     d = np.where(df.predicted_fraud == 1, (df.risk_score - THR) / (1 - THR), (THR - df.risk_score) / THR)
     df["confidence"] = (0.5 + 0.5 * d).clip(0, 1).round(4)
     df["alert_reason"] = [reason(r) for r in df.itertuples()]
+    if door.any():
+        P = ctx_parts(V_all[door], ctx_ref)
+        rows = df.loc[door, [c for c, _ in CTX_SPEC]].to_dict("records")
+        notes = [ctx_note(p_, r_) for p_, r_ in zip(P, rows)]
+        df.loc[door, "alert_reason"] = [n_ + ". " + a_ if not a_.startswith("Không có") else n_ + "."
+                                        for n_, a_ in zip(notes, df.loc[door, "alert_reason"])]
     df = df.sort_values(["risk_score", "amount"], ascending=[False, False]).reset_index(drop=True)
     df["priority_rank"] = np.arange(1, len(df) + 1)
     infer_ms = (time.perf_counter() - t1) * 1000 + feat_ms
@@ -735,16 +908,19 @@ def run(files, tables=None, progress=lambda msg: None, pretrained_path=PRETRAINE
     cases = make_cases(df)
     df["case_id"] = df.transaction_id.map(cases.attrs["map"])
     model_deploy = RT.FrozenModel(pipe_deploy, w_rules, iso, ref, THR, MED, nov_thr, VERSION,
-                                  {"train": "toàn bộ nhãn", "test": None, "start": None})
+                                  {"train": "toàn bộ nhãn", "test": None, "start": None},
+                                  ctx_ref=ctx_ref, ctx_thr=CTX_THR)
 
     if labeled:
         progress("Đang chạy thí nghiệm ẩn từng kiểu gian lận…")
-        rep["loto"] = leave_one_type_out(idx, y, ft, flags_B, X_all, an_all, THR, MED, nov_thr)
+        rep["loto"] = leave_one_type_out(idx, y, ft, flags_B, X_all, an_all, THR, MED, nov_thr,
+                                         ctx=ctx_all, door_thr=CTX_THR, grid=ctx_grid)
     rep.update({"mode": mode, "model_info": model_info, "threshold": round(THR, 4),
                 "medium_threshold": round(MED, 4), "rule_weights": w_rules, "novelty_threshold": round(nov_thr, 4),
                 "n_novelty": int(df.novelty.sum()),
                 "n_alerts": int(df.predicted_fraud.sum()), "n_cases": int(len(cases)),
-                "n_stepup": int((df.risk_level == "MEDIUM").sum()),
+                "n_stepup": int((df.risk_level == "MEDIUM").sum()), "n_ctx_door": int(door.sum()),
+                "context_layer": ctx_info,
                 "case_reduction": round(1 - len(cases) / max(1, df.predicted_fraud.sum()), 4),
                 "risk_level_counts": {k: int(v) for k, v in df.risk_level.value_counts().to_dict().items()},
                 "alert_rate_by_segment": df.groupby("customer_segment").predicted_fraud.mean().round(4).to_dict(),
@@ -812,6 +988,7 @@ def retrain_compare(res, extra):
     X = lab[FEATURES].fillna(0).values
     Fl = lab[list(RULE_W)].astype(int)
     an = lab.anomaly_score.values
+    cx = lab.ctx_score.values if "ctx_score" in lab else np.zeros(len(lab))
     yte = lab.is_fraud.values[te].astype(int)
     out = {"train_period": ref_txt, "test_period": live_txt, "n_test": int(te.sum()), "fraud_test": int(yte.sum()),
            "n_new_labels": int(tr_ex.sum()), "n_new_fraud": int(np.nansum(y_ex.values[tr_ex])),
@@ -824,7 +1001,7 @@ def retrain_compare(res, extra):
         thr = best_thr(y, s_tr); med = med_threshold(y, s_tr, thr)
         m = lr().fit(X[mask], y); rw = rule_weights(Fl[mask], y)
         s = W_FUSION[0] * m.predict_proba(X[te])[:, 1] + W_FUSION[1] * noisy_or(Fl[te], rw) + W_FUSION[2] * an[te]
-        p, pm = s >= thr, s >= med
+        p, pm = s >= thr, (s >= med) | (cx[te] > ctx_door_thr(cx[mask], y))
         out[tag] = {"n_train": int(mask.sum()), "fraud_train": int(y.sum()),
                     "pr_auc": round(float(average_precision_score(yte, s)), 4),
                     "recall": round(float(p[yte == 1].mean()), 4), "fp": int((p & (yte == 0)).sum()),
@@ -850,6 +1027,7 @@ def train_pretrained(files, out_path=PRETRAINED):
             "medium_threshold": res["report"]["medium_threshold"], "rule_weights": res["report"]["rule_weights"],
             "mean": sc.mean_.tolist(), "scale": sc.scale_.tolist(), "coef": clf.coef_[0].tolist(),
             "intercept": float(clf.intercept_[0]), "n_labels": int(len(lab)), "n_fraud": int(lab.y.sum()),
+            "context_ref_q": res["report"]["context_layer"]["ref_q"], "context_budget": CTX_BUDGET,
             "source": "Học trên 2.000 nhãn công khai của Data Pack BTC (snapshot 26/10/2026, chỉ dùng dữ liệu quá khứ)"}
     Path(out_path).write_text(json.dumps(pack, ensure_ascii=False, indent=1), encoding="utf-8")
     return res
