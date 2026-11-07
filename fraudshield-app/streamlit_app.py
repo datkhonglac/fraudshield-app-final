@@ -32,6 +32,8 @@ from sklearn.metrics import precision_recall_curve
 import fraud_core as F
 import fs_realtime as RT
 
+DEMO_SET = Path(__file__).resolve().parent / "data_demo" / "fs_pay_demo_1000.csv"
+
 # ----------------------------------------------------------------------------- cấu hình chung
 TEAM_NAME = ""  # điền tên đội, ví dụ "Đội ABC" – để trống thì không hiển thị
 BASE = Path(__file__).parent
@@ -1675,7 +1677,14 @@ def hub_get(res):
                 hist = RT.stream_order(T["transactions.csv"])
                 sc = RT.OnlineScorer(m, T["customers.csv"], T["merchants.csv"], T["devices.csv"])
                 sc.warm(hist.to_dict("records"))
-                hub.update(sc=sc, model=m, rows=[], i=0, events=[], by_id={}, seq=0,
+                try:
+                    demo = pd.read_csv(DEMO_SET).to_dict("records")
+                except Exception:  # noqa
+                    demo = []
+                cnt = hist.customer_id.value_counts()
+                custs = sorted(cnt[cnt >= 10].index.tolist(), key=lambda c: -cnt[c])[:30]
+                hub.update(names={c: DEMO_NAMES[i % len(DEMO_NAMES)] for i, c in enumerate(custs)}, offset=None)
+                hub.update(sc=sc, model=m, rows=demo, i=0, events=[], by_id={}, seq=0,
                            clock=pd.Timestamp(hist.datetime.iloc[-1]), speed=0.0, last_tick=time.time(),
                            n_hist=len(hist), labels={}, merch=T["merchants.csv"], cust=T["customers.csv"], hist=hist,
                            ready=True)
@@ -1687,13 +1696,15 @@ def _push(hub, t, src):
     hub["seq"] += 1
     mm = hub["sc"].merch.get(t["merchant_id"], {})
     ev = {"id": hub["seq"], "src": src, "tid": t["transaction_id"], "dt": pd.Timestamp(t["datetime"]),
+          "name": hub.get("names", {}).get(t["customer_id"]), "scenario": t.get("scenario"),
+          "sim_fraud": t.get("is_fraud_sim"),
           "cust": t["customer_id"], "amount": float(t["amount"]), "merchant": t["merchant_id"],
           "cat": mm.get("merchant_category", ""), "loc": t["location"], "ip": t["ip_country"], "dev": t["device_id"],
           "tx_status": t["transaction_status"], "score": r["risk_score"], "level": r["risk_level"],
           "reason": r["alert_reason"], "ms": r["latency_ms"], "wall": time.time(), "nov": r["novelty"],
           "status": ST_PENDING[r["risk_level"]], "y": hub["labels"].get(t["transaction_id"]),
           "recv": datetime.now(VN_TZ)}
-    if src == "Dữ liệu BTC" and r["risk_level"] == "MEDIUM":
+    if src == "Bộ mẫu" and r["risk_level"] == "MEDIUM":
         ev["status"] = "Đã yêu cầu xác thực thêm"
     if t["transaction_status"] != "SUCCESS" and r["risk_level"] in ("LOW", "MEDIUM"):
         ev["status"] = "Thất bại (sai OTP)"
@@ -1708,7 +1719,8 @@ def _push(hub, t, src):
 
 
 def hub_tick(hub):
-    """Phát giao dịch nền từ dữ liệu BTC theo tốc độ đã chọn (theo thời gian thật, dùng chung cho mọi người xem)."""
+    """Phát bộ 1.000 giao dịch mẫu của ứng dụng khách theo tốc độ đã chọn (theo thời gian thật, dùng chung cho mọi
+    người xem). Thời điểm giao dịch được dời ra sau đồng hồ luồng để luôn đúng thứ tự thời gian."""
     with hub["lock"]:
         now = time.time()
         if hub["speed"] <= 0 or hub["i"] >= len(hub["rows"]):
@@ -1717,12 +1729,52 @@ def hub_tick(hub):
         due = int((now - hub["last_tick"]) * hub["speed"])
         if due <= 0:
             return
-        for _ in range(min(due, 20)):
+        for _ in range(min(due, 30)):
             if hub["i"] >= len(hub["rows"]):
                 break
-            _push(hub, hub["rows"][hub["i"]], "Dữ liệu BTC")
+            t = dict(hub["rows"][hub["i"]])
+            dt0 = pd.Timestamp(t["datetime"])
+            if hub.get("offset") is None:
+                hub["offset"] = max(pd.Timedelta(0), hub["clock"] + pd.Timedelta(minutes=1) - dt0)
+            if dt0 + hub["offset"] <= hub["clock"]:  # có giao dịch tay chen vào → dời phần còn lại ra sau
+                hub["offset"] = hub["clock"] + pd.Timedelta(seconds=30) - dt0
+            t["datetime"] = dt0 + hub["offset"]
+            if t["device_id"] not in hub["sc"].dev:
+                rooted = bool(t.get("device_rooted"))
+                hub["sc"].dev[t["device_id"]] = {"first_seen_date": pd.Timestamp(t["datetime"]).normalize(),
+                                                 "registered_customer_id": None,
+                                                 "device_risk_level": "HIGH" if rooted else "MEDIUM",
+                                                 "rooted_or_jailbroken": rooted, "emulator_flag": False}
+            _push(hub, t, "Bộ mẫu")
             hub["i"] += 1
         hub["last_tick"] = now
+
+
+def hub_reset_cur():
+    res = st.session_state.get("res")
+    if res is not None:
+        hub_reset(res)
+    st.session_state.pop("demo_speed", None)
+
+
+def hub_reset(res):
+    live_hub(hub_key(res)).update(ready=False)
+    for k in ("ph_mine", "ph_last", "ph_newdev"):
+        st.session_state.pop(k, None)
+    st.session_state.ph_screen = "home"
+
+
+def demo_tally(hub):
+    with hub["lock"]:
+        evs = [x for x in hub["events"] if x.get("scenario")]
+    if not evs:
+        return None
+    fr = [x for x in evs if x.get("sim_fraud") == 1]
+    lg = [x for x in evs if x.get("sim_fraud") == 0]
+    blk = lambda xs: sum(x["level"] in ("CRITICAL", "HIGH") for x in xs)  # noqa: E731
+    med = lambda xs: sum(x["level"] == "MEDIUM" for x in xs)  # noqa: E731
+    return {"n": len(evs), "fr": len(fr), "fr_blk": blk(fr), "fr_med": med(fr), "fr_low": len(fr) - blk(fr) - med(fr),
+            "lg": len(lg), "lg_blk": blk(lg), "lg_med": med(lg)}
 
 
 def hub_action(hub, ev_id, act, ds):
@@ -1858,6 +1910,19 @@ def monitor_body(res):
                          f'<span class="r"><b>{money(x["amount"])}</b> {badge(x["level"])}'
                          f'<span class="act">{e(x["status"])}</span></span></div>')
         H('<div class="fs lv-feed">' + ("".join(items) or '<div class="fs-sub">Đang chờ giao dịch từ ứng dụng khách FS Pay…</div>') + "</div>")
+    tl = demo_tally(hub)
+    if tl:
+        with card("mon_demo"):
+            title("Đối chiếu với kịch bản của bộ 1.000 giao dịch mẫu",
+                  f"Chỉ để trình diễn: nhóm biết trước giao dịch nào là gian lận vì tự tạo kịch bản · "
+                  f"đã phát {n0(tl['n'])} / {n0(len(hub['rows']))} giao dịch")
+            H('<div class="fs fs-kgrid" style="margin:4px 0 2px">' + "".join([
+                kcard(f'{n0(tl["fr_blk"])} / {n0(tl["fr"])}', "Gian lận bị tạm giữ", GREEN,
+                      "chờ giám sát viên chặn / huỷ / xác thực"),
+                kcard(n0(tl["fr_med"]), "Gian lận bị hỏi xác thực thêm", BLUE, "khách phải xác minh lại mới đi tiếp"),
+                kcard(n0(tl["fr_low"]), "Gian lận lọt", LEVEL_COLOR["CRITICAL"], "mô hình cho qua"),
+                kcard(f'{n0(tl["lg_blk"])} / {n0(tl["lg"])}', "Giao dịch bình thường bị chặn nhầm", PURPLE,
+                      f'{n0(tl["lg_med"])} giao dịch bị hỏi thêm')]) + "</div>")
 
 
 def customer_url():
@@ -1910,7 +1975,10 @@ QUICK = [("💸", "Chuyển tiền", ["MONEY_TRANSFER"]), ("🧾", "Hoá đơn",
          ("🎮", "Giải trí", ["GAMING", "ENTERTAINMENT"]), ("🍜", "Ăn uống", ["DINING"]), ("⋯", "Tất cả", None)]
 # Tên minh hoạ (hư cấu) cho khách demo – dữ liệu BTC chỉ có mã khách đã ẩn danh
 DEMO_NAMES = ["Nguyễn Minh Anh", "Trần Quốc Bảo", "Lê Thu Hà", "Phạm Đức Huy", "Hoàng Ngọc Lan", "Vũ Thanh Tùng",
-              "Đặng Mai Phương", "Bùi Gia Khánh", "Đỗ Hải Yến", "Ngô Tuấn Kiệt", "Dương Thảo Vy", "Lý Hoàng Nam"]
+              "Đặng Mai Phương", "Bùi Gia Khánh", "Đỗ Hải Yến", "Ngô Tuấn Kiệt", "Dương Thảo Vy", "Lý Hoàng Nam",
+              "Phan Thị Ngọc", "Trịnh Văn Long", "Mai Khánh Linh", "Võ Đăng Khoa", "Hồ Bảo Trâm", "Tạ Minh Quân",
+              "Châu Ngọc Diệp", "Lâm Gia Huy", "Cao Thùy Dung", "Kiều Anh Tuấn", "Triệu Hồng Nhung", "Đinh Công Danh",
+              "Quách Thanh Tâm", "Lương Hải Đăng", "Tô Bích Ngân", "La Quốc Việt", "Mạc Thu Trang", "Ứng Đức Mạnh"]
 
 
 def cust_name(cid, custs):
@@ -2003,7 +2071,8 @@ def demo_customers(_hist, ds):
     if not len(h):
         return []
     cnt = h.customer_id.value_counts()
-    return cnt[cnt >= 8].index[:12].tolist()
+    # cùng cách chọn với tools/make_demo_set.py: 30 khách có nhiều lịch sử nhất
+    return sorted(cnt[cnt >= 10].index.tolist(), key=lambda c: -cnt[c])[:30]
 
 
 def cust_profile(hub, cid):
@@ -2283,6 +2352,7 @@ def control_panel(hub, custs, prof):
                 nm = names[i + j]
                 col.button(f"**{nm}**  \n{PRESETS[nm]['desc']}", key=f"sc_{i + j}", width="stretch",
                            on_click=_ph_preset, args=(nm, hub))
+        demo_player(hub)
         H('<div class="fs pn-g">Giao dịch vừa gửi → kết quả hệ thống trả về</div>')
         mine = [hub["by_id"][i] for i in ss.ph_mine if i in hub["by_id"]][::-1][:5]
         if mine:
@@ -2296,6 +2366,46 @@ def control_panel(hub, custs, prof):
         st.caption("Ứng dụng thanh toán mô phỏng “FS Pay” phục vụ trình diễn Fraud Shield – không phải ứng dụng của ngân "
                    "hàng thật. Tên khách là tên minh hoạ (hư cấu) gắn với mã khách đã ẩn danh trong dữ liệu BTC. Mô hình "
                    "chấm điểm không dùng giờ trong ngày nên bảng không có mục thời điểm.")
+
+
+SPEEDS = {"⏸ Tạm dừng": 0.0, "1 GD/giây": 1.0, "3 GD/giây": 3.0, "10 GD/giây": 10.0}
+
+
+def _set_speed(hub):
+    v = SPEEDS.get(st.session_state.get("demo_speed") or "⏸ Tạm dừng", 0.0)
+    with hub["lock"]:
+        hub["speed"] = v
+        hub["last_tick"] = time.time()
+
+
+def demo_progress(hub):
+    hub_tick(hub)
+    n, i = len(hub["rows"]), hub["i"]
+    if not n:
+        st.caption("Không tìm thấy tệp data_demo/fs_pay_demo_1000.csv.")
+        return
+    tl = demo_tally(hub)
+    st.progress(i / n, text=f"Đã phát {n0(i)} / {n0(n)} giao dịch" + (" · đã phát hết" if i >= n else ""))
+    if tl:
+        H(f'<div class="fs pn-sub">Đã phát {n0(tl["fr"])} giao dịch gian lận theo kịch bản: <b>{n0(tl["fr_blk"])}</b> tạm giữ · '
+          f'<b>{n0(tl["fr_med"])}</b> xác thực thêm · <b>{n0(tl["fr_low"])}</b> lọt. {n0(tl["lg"])} giao dịch bình thường: '
+          f'<b>{n0(tl["lg_blk"])}</b> chặn nhầm · <b>{n0(tl["lg_med"])}</b> hỏi thêm.</div>')
+
+
+def demo_player(hub):
+    """Phát bộ 1.000 giao dịch mẫu của ứng dụng khách lên luồng giám sát (dùng chung cho mọi người đang xem)."""
+    H('<div class="fs pn-g">Bộ 1.000 giao dịch mẫu – phát tự động lên trung tâm giám sát</div>')
+    H('<div class="fs pn-sub">1.000 giao dịch của 30 khách trong 4 ngày (có 89 giao dịch gian lận theo 8 kịch bản) do nhóm '
+      'tự tạo để trình diễn – không phải dữ liệu BTC. Có thể vừa phát vừa gửi giao dịch tay ở bên trái.</div>')
+    cur = next((k for k, v in SPEEDS.items() if v == hub["speed"]), "⏸ Tạm dừng")
+    if st.session_state.get("demo_speed") != cur:
+        st.session_state.demo_speed = cur
+    c = st.columns([3, 1.2], vertical_alignment="center")
+    c[0].segmented_control("Tốc độ phát", list(SPEEDS), key="demo_speed", label_visibility="collapsed",
+                           on_change=_set_speed, args=(hub,))
+    c[1].button("Làm mới luồng", icon=":material/restart_alt:", key="demo_reset", width="stretch",
+                on_click=hub_reset_cur, help="Xoá toàn bộ giao dịch trên luồng và phát lại bộ mẫu từ đầu")
+    st.fragment(demo_progress, run_every=1.0 if hub["speed"] > 0 and hub["i"] < len(hub["rows"]) else None)(hub)
 
 
 def phone_screen(hub, prof):

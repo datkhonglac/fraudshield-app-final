@@ -193,7 +193,7 @@ class OnlineScorer:
         f["n_txn_5m"] = n5
         f["n_fail_30m"] = nf
         f["n_succ_30m"] = (len(win) + 1) - nf
-        gap = ts - st["last"] if st["last"] is not None else np.nan
+        gap = max(0.0, ts - st["last"]) if st["last"] is not None else np.nan
         f["min_gap_s"] = gap
         f["log_min_gap"] = math.log1p(gap) if not pd.isna(gap) else math.log1p(1e7)
         keys = {"device": did, "location": t["location"], "channel": t["payment_channel"], "ip": t["ip_country"]}
