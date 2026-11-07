@@ -1660,30 +1660,25 @@ def live_hub(key):
 
 
 def hub_key(res):
-    m = res.get("model_live") or res["model"]
-    return f'{res["ds"]}|{m.name}|{res.get("version_label", "")}'
+    return f'{res["ds"]}|{res["model"].name}|{res.get("version_label", "")}|app-only'
 
 
 def hub_get(res):
+    """Luồng thời gian thực CHỈ nhận giao dịch từ ứng dụng khách FS Pay. Dữ liệu BTC không được phát lên luồng:
+    toàn bộ lịch sử chỉ dùng để dựng hồ sơ thói quen của khách (bảng trạng thái) và huấn luyện mô hình."""
     hub = live_hub(hub_key(res))
-    m = res.get("model_live") or res["model"]
+    m = res["model"]
     if not hub["ready"]:
         with hub["lock"]:
             if not hub["ready"]:
                 T = res["tables"]
-                order = RT.stream_order(T["transactions.csv"])
-                start = m.info.get("start")
-                dtv = pd.to_datetime(order.datetime)
-                hist = order[dtv < start] if start is not None else order.iloc[:0]
-                live = order[dtv >= start] if start is not None else order
+                hist = RT.stream_order(T["transactions.csv"])
                 sc = RT.OnlineScorer(m, T["customers.csv"], T["merchants.csv"], T["devices.csv"])
                 sc.warm(hist.to_dict("records"))
-                lab = T.get("fraud_labels_sample.csv")
-                hub.update(sc=sc, model=m, rows=live.to_dict("records"), i=0, events=[], by_id={}, seq=0,
-                           clock=pd.Timestamp(hist.datetime.iloc[-1]) if len(hist) else pd.Timestamp(order.datetime.iloc[0]),
-                           speed=1.0, last_tick=time.time(), n_hist=len(hist),
-                           labels=dict(zip(lab.transaction_id, lab.is_fraud.astype(int))) if lab is not None else {},
-                           merch=T["merchants.csv"], cust=T["customers.csv"], hist=hist, ready=True)
+                hub.update(sc=sc, model=m, rows=[], i=0, events=[], by_id={}, seq=0,
+                           clock=pd.Timestamp(hist.datetime.iloc[-1]), speed=0.0, last_tick=time.time(),
+                           n_hist=len(hist), labels={}, merch=T["merchants.csv"], cust=T["customers.csv"], hist=hist,
+                           ready=True)
     return hub
 
 
@@ -1696,7 +1691,8 @@ def _push(hub, t, src):
           "cat": mm.get("merchant_category", ""), "loc": t["location"], "ip": t["ip_country"], "dev": t["device_id"],
           "tx_status": t["transaction_status"], "score": r["risk_score"], "level": r["risk_level"],
           "reason": r["alert_reason"], "ms": r["latency_ms"], "wall": time.time(), "nov": r["novelty"],
-          "status": ST_PENDING[r["risk_level"]], "y": hub["labels"].get(t["transaction_id"])}
+          "status": ST_PENDING[r["risk_level"]], "y": hub["labels"].get(t["transaction_id"]),
+          "recv": datetime.now(VN_TZ)}
     if src == "Dữ liệu BTC" and r["risk_level"] == "MEDIUM":
         ev["status"] = "Đã yêu cầu xác thực thêm"
     if t["transaction_status"] != "SUCCESS" and r["risk_level"] in ("LOW", "MEDIUM"):
@@ -1763,7 +1759,7 @@ def pending_panel(hub, res, kp, limit=5):
         return 0
     for ev in evs[:limit]:
         sla, col = sla_left(ev)
-        src = '<span class="lv-src">📱 Điện thoại khách</span>' if ev["src"] != "Dữ liệu BTC" else ""
+        src = ""
         H(f'<div class="fs lv-alert" style="--c:{LEVEL_COLOR[ev["level"]]}"><div class="h"><span>{badge(ev["level"])} '
           f'<b>{e(ev["tid"])}</b> · {e(who(ev))} · <b>{money(ev["amount"])}</b>{src}</span>'
           f'<span class="lv-sla" style="color:{col}">{sla}</span></div>'
@@ -1811,13 +1807,11 @@ def monitor_body(res):
     hub_tick(hub)
     with hub["lock"]:
         evs = list(hub["events"])
-        clock, speed, left = hub["clock"], hub["speed"], len(hub["rows"]) - hub["i"]
     lv = pd.Series([x["level"] for x in evs]).value_counts() if evs else pd.Series(dtype=int)
     ms = [x["ms"] for x in evs[-200:]] or [0.0]
-    on = speed > 0 and left > 0
     n_pend = len(pending_events(hub))
-    H(f'<div class="fs lv-strip"><span class="lv-on {"" if on else "off"}"><i></i>{"ĐANG HOẠT ĐỘNG" if on else "TẠM DỪNG NỀN"}</span>'
-      f'<span class="lv-clock">Đồng hồ luồng<br><b>{clock:%d/%m/%Y %H:%M:%S}</b></span><div class="lv-cnt">'
+    H(f'<div class="fs lv-strip"><span class="lv-on"><i></i>ĐANG HOẠT ĐỘNG</span>'
+      f'<span class="lv-clock">Bây giờ<br><b>{datetime.now(VN_TZ):%d/%m/%Y %H:%M:%S}</b></span><div class="lv-cnt">'
       f'<div><b>{n0(len(evs))}</b><span>đã chấm</span></div>'
       f'<div><b style="color:#FF8787">{n0(lv.get("CRITICAL", 0) + lv.get("HIGH", 0))}</b><span>tạm giữ</span></div>'
       f'<div><b style="color:#FFD43B">{n0(lv.get("MEDIUM", 0))}</b><span>xác thực thêm</span></div>'
@@ -1827,7 +1821,7 @@ def monitor_body(res):
     c1, c2 = st.columns([1.15, 1], gap="medium")
     with c1, card("mon_chart"):
         title("Điểm rủi ro của các giao dịch vừa đến",
-              f"Trên đường đỏ: tạm giữ · giữa hai đường: xác thực thêm · ★ giao dịch từ điện thoại khách")
+              f"Mỗi điểm là một giao dịch từ ứng dụng khách · trên đường đỏ: tạm giữ · giữa hai đường: xác thực thêm")
         last = evs[-90:]
         fig = go.Figure()
         if last:
@@ -1837,8 +1831,7 @@ def monitor_body(res):
                 pts = [x for x in last if x["level"] == lvl]
                 if pts:
                     fig.add_scatter(x=[x["id"] for x in pts], y=[x["score"] for x in pts], mode="markers", name=lvl,
-                                    marker=dict(color=LEVEL_COLOR[lvl], size=[16 if x["src"] != "Dữ liệu BTC" else 9 for x in pts],
-                                                symbol=["star" if x["src"] != "Dữ liệu BTC" else "circle" for x in pts],
+                                    marker=dict(color=LEVEL_COLOR[lvl], size=14, symbol="circle",
                                                 line=dict(color="#fff", width=1)),
                                     hovertext=[f'{x["tid"]} · {x["cust"]} · {money(x["amount"])}' for x in pts],
                                     hovertemplate="%{hovertext}<br>điểm %{y:.3f}<extra></extra>")
@@ -1858,13 +1851,13 @@ def monitor_body(res):
         now = time.time()
         items = []
         for x in evs[-10:][::-1]:
-            src = '<span class="lv-src">📱 Điện thoại khách</span>' if x["src"] != "Dữ liệu BTC" else ""
+            src = ""
             items.append(f'<div class="lv-it {"new" if now - x["wall"] < 2.5 else ""}" style="--c:{LEVEL_COLOR[x["level"]]}">'
-                         f'<span class="t">{x["dt"]:%H:%M:%S}</span><span class="m"><b>{e(who(x))}</b> → {e(x["merchant"])} '
+                         f'<span class="t">{x.get("recv", x["dt"]):%H:%M:%S}</span><span class="m"><b>{e(who(x))}</b> → {e(x["merchant"])} '
                          f'{e(x["cat"])} · {e(PROV_VN.get(x["loc"], x["loc"]))} · IP {e(x["ip"])}{src}</span>'
                          f'<span class="r"><b>{money(x["amount"])}</b> {badge(x["level"])}'
                          f'<span class="act">{e(x["status"])}</span></span></div>')
-        H('<div class="fs lv-feed">' + ("".join(items) or '<div class="fs-sub">Chưa có giao dịch.</div>') + "</div>")
+        H('<div class="fs lv-feed">' + ("".join(items) or '<div class="fs-sub">Đang chờ giao dịch từ ứng dụng khách FS Pay…</div>') + "</div>")
 
 
 def customer_url():
@@ -1883,18 +1876,12 @@ def page_live(res):
     m = hub["model"]
     url = customer_url()
     with card("live_head"):
-        c = st.columns([2.4, 1.15, 1.05], vertical_alignment="center")
-        c[0].markdown(f"**Trung tâm giám sát thời gian thực** · mô hình học trên {m.info.get('train') or 'toàn bộ nhãn'}, "
+        c = st.columns([3.2, 1.1], vertical_alignment="center")
+        c[0].markdown(f"**Trung tâm giám sát thời gian thực** · chỉ nhận giao dịch phát sinh từ ứng dụng khách FS Pay, "
                       f"chấm từng giao dịch ngay khi đến · ngưỡng tạm giữ {d(m.thr, 2)}, xác thực thêm {d(m.med, 2)}")
-        cur = next((k for k, v in BG_SPEEDS.items() if v == hub["speed"]), "1 GD/giây")
-        sp = c[1].segmented_control("Giao dịch nền", list(BG_SPEEDS), default=cur, key="bg_speed",
-                                    help="Giao dịch nền phát lại từ dữ liệu BTC tháng 5–6 để màn hình luôn có hoạt động")
-        if sp is not None and BG_SPEEDS[sp] != hub["speed"]:
-            with hub["lock"]:
-                hub["speed"] = BG_SPEEDS[sp]; hub["last_tick"] = time.time()
-        c[2].link_button("Mở ứng dụng khách FS Pay", url, icon=":material/smartphone:", type="primary", width="stretch")
-        st.caption(f"Ứng dụng khách mở ở tab hoặc thiết bị riêng (gửi link sang điện thoại: {url}). Giao dịch khách thực hiện "
-                   "sẽ hiện ở đây trong khoảng 1 giây, kèm nhãn 📱.")
+        c[1].link_button("Mở ứng dụng khách FS Pay", url, icon=":material/smartphone:", type="primary", width="stretch")
+        st.caption(f"Lịch sử {n0(hub['n_hist'])} giao dịch BTC không được phát lên luồng – chỉ dùng để dựng hồ sơ thói quen "
+                   f"của khách và huấn luyện mô hình. Gửi link sang điện thoại: {url}")
     st.fragment(monitor_body, run_every=1.0)(res)
     with st.expander("Bằng chứng kỹ thuật: kiểm tra trùng khớp chấm theo luồng và chấm theo lô", icon=":material/fact_check:"):
         par = st.session_state.setdefault("parity", {})
@@ -2300,7 +2287,7 @@ def control_panel(hub, custs, prof):
         mine = [hub["by_id"][i] for i in ss.ph_mine if i in hub["by_id"]][::-1][:5]
         if mine:
             H('<div class="fs pn-log">' + "".join(
-                f'<div><span>{x["dt"]:%H:%M:%S} · {e(x["tid"])} · {money(x["amount"])} · {e(x["dev"])} · IP {e(x["ip"])}'
+                f'<div><span>{x.get("recv", x["dt"]):%H:%M:%S} · {e(x["tid"])} · {money(x["amount"])} · {e(x["dev"])} · IP {e(x["ip"])}'
                 f'{" · " + ("thất bại" if x["tx_status"] != "SUCCESS" else "") if x["tx_status"] != "SUCCESS" else ""}</span>'
                 f'<span class="pn-bd" style="background:{LEVEL_COLOR[x["level"]]}">{x["level"]} · '
                 f'{e(x["status"].split(" · ")[0].lower())}</span></div>' for x in mine) + "</div>")
