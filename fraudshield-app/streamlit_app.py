@@ -1619,13 +1619,6 @@ BG_SPEEDS = {"Tạm dừng": 0.0, "1 GD/giây": 1.0, "3 GD/giây": 3.0}
 ST_PENDING = {"CRITICAL": "Tạm giữ · chờ giám sát viên", "HIGH": "Tạm giữ · chờ giám sát viên",
               "MEDIUM": "Chờ khách xác thực OTP", "LOW": "Thành công"}
 DONE_LIVE = {"block": "Đã chặn giao dịch", "cancel": "Đã huỷ · hoàn tiền cho khách", "ok": "Đã xác thực · cho qua"}
-PRESETS = {
-    "Mua sắm bình thường": dict(dev="Máy quen của tôi", place="Nơi ở", ip="VN", otp="Đúng", mult=1.0, mrisk="LOW"),
-    "Máy lạ ở nước ngoài": dict(dev="Máy lạ", place="Tỉnh khác", ip="SG", otp="Đúng", mult=5.0, mrisk="LOW"),
-    "Thử sai OTP liên tục": dict(dev="Máy lạ", place="Nơi ở", ip="VN", otp="Sai 2 lần rồi đúng", mult=3.0, mrisk="LOW"),
-    "Chuyển gấp 10 lần": dict(dev="Máy quen của tôi", place="Nơi ở", ip="VN", otp="Đúng", mult=10.0, mrisk="HIGH"),
-}
-
 LIVE_CSS = """<style>
 .lv-strip{display:flex;align-items:center;gap:18px;flex-wrap:wrap;background:#0B2552;color:#fff;border-radius:14px;
 padding:12px 18px;margin-bottom:14px}
@@ -1812,140 +1805,6 @@ def parity_view(p):
       f'bằng chứng mô hình không dùng dữ liệu tương lai.</div>')
 
 
-# ---------------------------------------------------------------- điện thoại khách hàng
-@st.cache_data(show_spinner=False)
-def demo_customers(_hist, ds):
-    h = _hist
-    if not len(h):
-        return []
-    cnt = h.customer_id.value_counts()
-    return cnt[cnt >= 8].index[:12].tolist()
-
-
-def cust_profile(hub, cid):
-    k = hub["sc"].cust.get(cid, {})
-    h = hub["hist"][hub["hist"].customer_id == cid]
-    dev = h.device_id.mode().iloc[0] if len(h) else f"DEV-{cid}"
-    return {"home": k.get("home_location", "Hanoi"), "avg": float(k.get("avg_transaction_amount", 1e6) or 1e6),
-            "dev": dev, "seg": k.get("customer_segment", "")}
-
-
-def _set_preset(name, hub):
-    p = PRESETS[name]
-    st.session_state.ph_dev = p["dev"]; st.session_state.ph_place = p["place"]
-    st.session_state.ph_ip = p["ip"]; st.session_state.ph_otp = p["otp"]
-    prof = cust_profile(hub, st.session_state.get("ph_cust"))
-    st.session_state.ph_amt = int(round(prof["avg"] * p["mult"] / 1000) * 1000)
-    ms = hub["merch"]
-    pool = ms[ms.merchant_risk_level == p["mrisk"]]
-    if len(pool):
-        st.session_state.ph_mer = pool.merchant_id.iloc[0]
-
-
-def phone_submit(hub, res):
-    cid = st.session_state.ph_cust
-    prof = cust_profile(hub, cid)
-    other = [p for p in PROV_VN if p != prof["home"]]
-    loc = prof["home"] if st.session_state.ph_place == "Nơi ở" else other[hash(cid) % len(other)]
-    with hub["lock"]:
-        if st.session_state.ph_dev == "Máy lạ":
-            dev = st.session_state.get("ph_newdev")
-            if not dev:
-                dev = f"DEV-LA-{hub['seq'] + 1:04d}"
-                hub["sc"].dev[dev] = {"first_seen_date": hub["clock"].normalize(), "registered_customer_id": None,
-                                      "device_risk_level": "MEDIUM", "rooted_or_jailbroken": False, "emulator_flag": False}
-                st.session_state.ph_newdev = dev
-        else:
-            dev = prof["dev"]
-        otp = st.session_state.ph_otp
-        statuses = ["FAILED", "FAILED", "SUCCESS"] if otp.startswith("Sai") else ["SUCCESS"]
-        ids = []
-        for k, sts in enumerate(statuses):
-            t0 = hub["clock"] + pd.Timedelta(seconds=20 if k else 15)
-            hub["clock"] = t0
-            t = {"transaction_id": f"LIVE-{hub['seq'] + 1:04d}", "customer_id": cid,
-                 "merchant_id": st.session_state.ph_mer, "datetime": t0, "amount": float(st.session_state.ph_amt),
-                 "currency": "VND", "payment_channel": "MOBILE_BANKING", "device_id": dev, "location": loc,
-                 "transaction_status": sts, "ip_country": st.session_state.ph_ip, "is_card_present": False,
-                 "authentication_method": "BIOMETRIC" if st.session_state.ph_dev != "Máy lạ" else "OTP"}
-            ids.append(_push(hub, t, "Điện thoại khách")["id"])
-    st.session_state.ph_last = ids[-1]
-
-
-def phone_otp(hub, ev_id, ok):
-    with hub["lock"]:
-        ev = hub["by_id"].get(ev_id)
-        if ev and ev["status"].startswith("Chờ khách"):
-            ev["status"] = "Thành công sau xác thực OTP" if ok else "Khách từ chối · đã huỷ"
-
-
-def phone_result(hub):
-    ev = hub["by_id"].get(st.session_state.get("ph_last"))
-    if not ev:
-        return
-    s = ev["status"]
-    if s.startswith("Thành công") or s.startswith("Đã xác thực"):
-        bg, ic, t, dsc = "#E6F4EA", "✅", "Thanh toán thành công", s
-    elif s.startswith("Chờ khách"):
-        bg, ic, t, dsc = "#FFF8E1", "🔐", "Cần xác thực thêm", "Giao dịch có dấu hiệu bất thường. Nhập mã OTP vừa gửi để tiếp tục."
-    elif s.startswith("Tạm giữ"):
-        bg, ic, t, dsc = "#FFF4E6", "⏳", "Giao dịch đang được kiểm tra", ("Ngân hàng tạm giữ giao dịch để xác minh. "
-                                                                             "Vui lòng chờ trong giây lát…")
-    else:
-        bg, ic, t, dsc = "#FFE3E3", "⛔", "Giao dịch không thành công", s
-    H(f'<div class="fs ph-res" style="background:{bg}"><div class="ic">{ic}</div><div class="t">{t}</div>'
-      f'<div class="d">{e(ev["tid"])} · {money(ev["amount"])}<br>{e(dsc)}</div></div>')
-    if s.startswith("Chờ khách"):
-        c = st.columns(2)
-        c[0].button("Nhập OTP đúng", key=f"ph_ok_{ev['id']}", type="primary", width="stretch",
-                    on_click=phone_otp, args=(hub, ev["id"], True))
-        c[1].button("Không phải tôi", key=f"ph_no_{ev['id']}", width="stretch",
-                    on_click=phone_otp, args=(hub, ev["id"], False))
-
-
-def phone_app(res, standalone=False):
-    hub = hub_get(res)
-    custs = demo_customers(hub["hist"], res["ds"])
-    if not custs:
-        st.caption("Không có khách hàng mẫu.")
-        return
-    st.session_state.setdefault("ph_cust", custs[0])
-    prof = cust_profile(hub, st.session_state.ph_cust)
-    st.session_state.setdefault("ph_amt", int(round(prof["avg"] / 1000) * 1000))
-    st.session_state.setdefault("ph_mer", hub["merch"].merchant_id.iloc[0])
-    for k, v in [("ph_dev", "Máy quen của tôi"), ("ph_place", "Nơi ở"), ("ph_ip", "VN"), ("ph_otp", "Đúng")]:
-        st.session_state.setdefault(k, v)
-    with card("phone"):
-        H('<div class="fs ph-top"><div><div class="b">FS Pay</div><div class="s">Ứng dụng thanh toán mô phỏng</div></div>'
-          f'<div class="s">📱 {e(st.session_state.ph_cust)}</div></div>')
-        st.selectbox("Tài khoản", custs, key="ph_cust",
-                     format_func=lambda c: f"{c} · {PROV_VN.get(cust_profile(hub, c)['home'], '')}",
-                     on_change=lambda: st.session_state.pop("ph_newdev", None))
-        ms = hub["merch"]
-        st.selectbox("Thanh toán cho", ms.merchant_id.tolist(), key="ph_mer",
-                     format_func=lambda m: f"{m} · {ms.set_index('merchant_id').merchant_category.get(m, '')}"
-                                           f"{' · rủi ro cao' if ms.set_index('merchant_id').merchant_risk_level.get(m) == 'HIGH' else ''}")
-        st.number_input("Số tiền (VND)", min_value=10000, step=50000, key="ph_amt",
-                        help=f"Mức thường của tài khoản này khoảng {money(prof['avg'])}")
-        with st.expander("Bối cảnh giả lập (thiết bị, nơi, mạng, OTP)", expanded=not standalone):
-            c = st.columns(2)
-            c[0].selectbox("Thiết bị", ["Máy quen của tôi", "Máy lạ"], key="ph_dev",
-                           on_change=lambda: st.session_state.pop("ph_newdev", None))
-            c[1].selectbox("Nơi giao dịch", ["Nơi ở", "Tỉnh khác"], key="ph_place")
-            c = st.columns(2)
-            c[0].selectbox("Mạng (IP)", list(IP_VN), key="ph_ip", format_func=lambda x: IP_VN[x])
-            c[1].selectbox("OTP", ["Đúng", "Sai 2 lần rồi đúng"], key="ph_otp")
-        H('<div class="fs-sub" style="margin:4px 0 2px">Kịch bản demo (điền nhanh)</div>')
-        c = st.columns(2)
-        for i, nm in enumerate(PRESETS):
-            c[i % 2].button(nm, key=f"pre_{i}", width="stretch", on_click=_set_preset, args=(nm, hub))
-        st.button("Thanh toán", icon=":material/send:", type="primary", width="stretch", key="ph_pay",
-                  on_click=phone_submit, args=(hub, res))
-        ev = hub["by_id"].get(st.session_state.get("ph_last"))
-        waiting = ev is not None and (ev["status"].startswith("Tạm giữ") or ev["status"].startswith("Chờ khách"))
-        st.fragment(phone_result, run_every=1.0 if waiting else None)(hub)
-
-
 # ---------------------------------------------------------------- màn hình giám sát
 def monitor_body(res):
     hub = hub_get(res)
@@ -2050,15 +1909,409 @@ def page_live(res):
             parity_view(par[res["rid"]])
 
 
+# ---------------------------------------------------------------- ứng dụng khách FS Pay (trang riêng ?view=khach)
+CAT_VN = {"DIGITAL_SERVICE": "Dịch vụ số", "DINING": "Ăn uống", "EDUCATION": "Giáo dục", "ELECTRONICS": "Điện máy",
+          "ENTERTAINMENT": "Giải trí", "FASHION": "Thời trang", "FUEL": "Xăng dầu", "GAMING": "Game",
+          "GROCERY": "Siêu thị", "HEALTHCARE": "Y tế", "HOTEL": "Khách sạn", "MONEY_TRANSFER": "Chuyển tiền",
+          "ONLINE_MARKETPLACE": "Sàn TMĐT", "OTHER": "Khác", "TRAVEL": "Du lịch"}
+CAT_ICON = {"DIGITAL_SERVICE": "📶", "DINING": "🍜", "EDUCATION": "🎓", "ELECTRONICS": "💻", "ENTERTAINMENT": "🎬",
+            "FASHION": "🛍️", "FUEL": "⛽", "GAMING": "🎮", "GROCERY": "🛒", "HEALTHCARE": "🏥", "HOTEL": "🏨",
+            "MONEY_TRANSFER": "💸", "ONLINE_MARKETPLACE": "📦", "OTHER": "🧾", "TRAVEL": "✈️"}
+QUICK = [("💸", "Chuyển tiền", ["MONEY_TRANSFER"]), ("🧾", "Hoá đơn", ["DIGITAL_SERVICE", "EDUCATION", "HEALTHCARE"]),
+         ("🛍️", "Mua sắm", ["FASHION", "ELECTRONICS", "ONLINE_MARKETPLACE", "GROCERY"]),
+         ("📱", "Nạp tiền ĐT", ["DIGITAL_SERVICE"]), ("✈️", "Vé, khách sạn", ["TRAVEL", "HOTEL"]),
+         ("🎮", "Game, giải trí", ["GAMING", "ENTERTAINMENT"]), ("🍜", "Ăn uống", ["DINING"]), ("⋯", "Tất cả", None)]
+DEVICES = ["📱 Máy quen", "🆕 Máy lạ, vừa đăng nhập", "⚠️ Máy đã root / giả lập"]
+CHANNELS = {"MOBILE_BANKING": "App ngân hàng", "E_WALLET": "Ví điện tử", "CARD": "Thẻ", "QR": "Quét QR",
+            "BANK_TRANSFER": "Chuyển khoản"}
+OTP_MODES = ["Nhập đúng", "Nhập sai 2 lần trước"]
+PRESETS = {
+    "🛒 Mua sắm bình thường": dict(desc="Máy quen, ở nhà, số tiền như mọi khi", dev=0, home=True, ip="VN", otp=0,
+                                   mult=1.0, cat=["FASHION", "GROCERY", "ONLINE_MARKETPLACE"], mrisk="LOW"),
+    "🌏 Máy lạ ở nước ngoài": dict(desc="Máy mới, IP Singapore, gấp 5 lần mức thường", dev=1, home=False, ip="SG", otp=0,
+                                  mult=5.0, cat=["ELECTRONICS", "ONLINE_MARKETPLACE"], mrisk="LOW"),
+    "🔑 Thử sai OTP liên tục": dict(desc="Máy lạ, nhập sai OTP 2 lần rồi đúng trong 1 phút", dev=1, home=True, ip="VN",
+                                    otp=1, mult=3.0, cat=["GAMING"], mrisk="LOW"),
+    "💰 Chuyển gấp 10 lần": dict(desc="Merchant rủi ro cao, số tiền bất thường", dev=0, home=True, ip="VN", otp=0,
+                                mult=10.0, cat=["MONEY_TRANSFER", "GAMING", "HOTEL"], mrisk="HIGH"),
+}
+
+PHONE_CSS = """<style>
+section[data-testid="stSidebar"],header[data-testid="stHeader"],[data-testid="stToolbar"],
+[data-testid="collapsedControl"],[data-testid="stSidebarCollapsedControl"]{display:none!important}
+.block-container,[data-testid="stMainBlockContainer"]{max-width:1180px!important;padding-top:1.4rem!important}
+.stApp{background:linear-gradient(150deg,#E6EDFB 0%,#F4F7FC 55%,#EEF2F8 100%)!important}
+.st-key-fsphone{width:380px!important;max-width:100%;margin:0 auto;min-height:790px;background:#F5F7FB;border:12px solid #0B1220;
+border-radius:52px;padding:0 0 14px!important;box-shadow:0 30px 60px rgba(15,23,42,.25);overflow:hidden;gap:.55rem!important}
+.st-key-fsphone [data-testid="stVerticalBlock"]{gap:.5rem}
+.st-key-fsphone .stElementContainer,.st-key-fsphone [data-testid="stHorizontalBlock"]{padding:0 14px}
+.st-key-fsphone .stElementContainer:has(.ph-full){padding:0}
+.st-key-fsphone [data-testid="stHorizontalBlock"] [data-testid="stHorizontalBlock"]{padding:0}
+.ph-sb{height:44px;display:flex;justify-content:space-between;align-items:flex-end;padding:0 28px 6px;font-size:13px;font-weight:600;position:relative}
+.ph-sb:after{content:"";position:absolute;top:9px;left:50%;transform:translateX(-50%);width:104px;height:28px;background:#0B1220;border-radius:18px}
+.ph-blue{background:linear-gradient(135deg,#123A8C,#1E56C8 60%,#3B7BF0);color:#fff}
+.ph-hero{padding:6px 20px 64px}.ph-hero .hi{font-size:12.5px;opacity:.85}.ph-hero .nm{font-size:16.5px;font-weight:700}
+.ph-hero .row{display:flex;justify-content:space-between;align-items:center}
+.ph-hero .bell{width:38px;height:38px;border-radius:50%;background:rgba(255,255,255,.2);display:grid;place-items:center}
+.ph-bal{margin:-54px 14px 0;background:#fff;border-radius:20px;padding:14px 16px;box-shadow:0 10px 24px rgba(30,86,200,.15);position:relative}
+.ph-bal .l{font-size:12px;color:#64748B}.ph-bal .v{font-size:25px;font-weight:800;letter-spacing:-.02em;margin:3px 0 2px}
+.ph-bal .a{font-size:11.5px;color:#64748B;display:flex;justify-content:space-between}.ph-bal .a b{color:#1E56C8}
+.ph-sec{display:flex;justify-content:space-between;font-size:14px;font-weight:700;margin-top:4px}
+.ph-sec span{font-size:12px;color:#1E56C8;font-weight:600}
+.ph-tx{background:#fff;border-radius:14px;padding:10px 12px;display:flex;align-items:center;gap:10px;font-size:12.5px;margin-top:6px}
+.ph-tx i{width:34px;height:34px;border-radius:11px;background:#EEF3FF;display:grid;place-items:center;font-style:normal;font-size:16px}
+.ph-tx .m{flex:1;min-width:0}.ph-tx .m b{display:block;font-size:12.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.ph-tx .m small{color:#64748B;font-size:11px}.ph-tx .x{font-weight:700;white-space:nowrap}
+.ph-nav{display:flex;justify-content:space-around;align-items:center;background:#fff;border-top:1px solid #E6EAF2;
+padding:8px 4px 6px;margin-top:8px;font-size:10.5px;color:#94A3B8;text-align:center}
+.ph-nav b{display:block;font-size:18px;font-weight:400}.ph-nav .on{color:#1E56C8;font-weight:700}
+.ph-nav .qr{width:48px;height:48px;border-radius:16px;background:#1E56C8;color:#fff;display:grid;place-items:center;font-size:20px;
+margin-top:-22px;box-shadow:0 8px 18px rgba(30,86,200,.35)}
+.ph-hdr{font-weight:700;font-size:16px;padding-top:2px}
+.ph-card{background:#fff;border-radius:16px;padding:12px 14px;font-size:13px}
+.ph-card .r{display:flex;justify-content:space-between;padding:4px 0}.ph-card .r span{color:#64748B}
+.ph-warn{background:#FFF8E1;border-radius:14px;padding:10px 12px;font-size:12.5px;color:#7A5200;line-height:1.5}
+.ph-otp{display:flex;gap:7px;justify-content:center;margin:4px 0}
+.ph-otp b{width:38px;height:46px;border-radius:12px;background:#fff;border:1.5px solid #CBD5E1;display:grid;place-items:center;font-size:20px}
+.ph-res{text-align:center;padding:26px 6px 6px}.ph-res .ic{width:88px;height:88px;border-radius:50%;display:grid;place-items:center;
+font-size:42px;margin:0 auto 14px}.ph-res h3{font-size:19px;margin:0 0 6px;color:#0F172A}
+.ph-res p{font-size:13px;color:#475569;line-height:1.5;margin:0}
+.st-key-fsphone [class*="st-key-qa_"] button{height:76px;border-radius:16px;border:none;background:#fff;
+box-shadow:0 2px 8px rgba(15,23,42,.05);padding:4px 2px;font-size:11px;line-height:1.2;white-space:normal}
+.st-key-fsphone [class*="st-key-qa_"] button p{font-size:11px!important}
+.st-key-fsphone [class*="st-key-chip_"] button{border-radius:20px;background:#EEF3FF;color:#1E56C8;border:none;
+font-size:11.5px;min-height:30px;padding:2px 6px}
+.st-key-fspanel{background:#fff;border-radius:22px;border:1px solid #E3E8F0;box-shadow:0 14px 34px rgba(15,23,42,.08);
+padding:20px 22px!important}
+.pn-h{font-size:18px;font-weight:800;display:flex;align-items:center;gap:10px;color:#0F172A}
+.pn-h em{font-style:normal;font-size:11px;background:#FFF3BF;color:#8A6100;border-radius:8px;padding:3px 8px;font-weight:700}
+.pn-sub{font-size:12.5px;color:#64748B;margin:2px 0 4px}
+.pn-g{font-size:11.5px;font-weight:700;color:#475569;text-transform:uppercase;letter-spacing:.05em;margin-top:6px}
+.st-key-fspanel [class*="st-key-sc_"] button{min-height:70px;border-radius:14px;white-space:normal;text-align:left;justify-content:flex-start}
+.pn-log div{display:flex;justify-content:space-between;align-items:center;gap:8px;padding:7px 0;border-bottom:1px dashed #E6EAF2;font-size:12.5px}
+.pn-bd{font-size:10.5px;font-weight:800;border-radius:6px;padding:3px 7px;color:#fff;white-space:nowrap}
+@media (max-width:640px){.st-key-fsphone{border-width:0;border-radius:0;box-shadow:none;width:100%!important}}
+</style>"""
+
+
+@st.cache_data(show_spinner=False)
+def demo_customers(_hist, ds):
+    h = _hist
+    if not len(h):
+        return []
+    cnt = h.customer_id.value_counts()
+    return cnt[cnt >= 8].index[:12].tolist()
+
+
+def cust_profile(hub, cid):
+    k = hub["sc"].cust.get(cid, {})
+    h = hub["hist"][hub["hist"].customer_id == cid]
+    return {"home": k.get("home_location", "Hanoi"), "avg": float(k.get("avg_transaction_amount", 1e6) or 1e6),
+            "dev": h.device_id.mode().iloc[0] if len(h) else f"DEV-{cid}",
+            "chan": h.payment_channel.mode().iloc[0] if len(h) else "MOBILE_BANKING",
+            "seg": k.get("customer_segment", ""), "hist": h}
+
+
+def _ph_reset_cust():
+    st.session_state.pop("ph_newdev", None)
+    st.session_state.pop("ph_loc", None)
+    st.session_state.pop("ph_chan", None)
+
+
+def _ph_defaults(hub, custs):
+    ss = st.session_state
+    ss.setdefault("ph_cust", custs[0])
+    prof = cust_profile(hub, ss.ph_cust)
+    ss.setdefault("ph_screen", "home")
+    ss.setdefault("ph_dev", DEVICES[0])
+    ss.setdefault("ph_loc", prof["home"])
+    ss.setdefault("ph_ip", "VN")
+    ss.setdefault("ph_chan", prof["chan"] if prof["chan"] in CHANNELS else "MOBILE_BANKING")
+    ss.setdefault("ph_otp", OTP_MODES[0])
+    ss.setdefault("ph_amt", int(round(prof["avg"] / 1000) * 1000))
+    ss.setdefault("ph_cat", None)
+    ss.setdefault("ph_mer", hub["merch"].merchant_id.iloc[0])
+    ss.setdefault("ph_note", "")
+    ss.setdefault("ph_mine", [])
+    return prof
+
+
+def _ph_go(screen, cat=None, hub=None):
+    st.session_state.ph_screen = screen
+    if screen == "pay":
+        st.session_state.ph_cat = cat
+        if hub is not None:
+            ms = hub["merch"]
+            pool = ms if not cat else ms[ms.merchant_category.isin(cat)]
+            if len(pool) and st.session_state.get("ph_mer") not in set(pool.merchant_id):
+                st.session_state.ph_mer = pool.merchant_id.iloc[0]
+
+
+def _ph_preset(name, hub):
+    p = PRESETS[name]
+    ss = st.session_state
+    prof = cust_profile(hub, ss.ph_cust)
+    ss.ph_dev = DEVICES[p["dev"]]
+    ss.pop("ph_newdev", None)
+    other = [x for x in PROV_VN if x != prof["home"]]
+    ss.ph_loc = prof["home"] if p["home"] else other[sum(map(ord, ss.ph_cust)) % len(other)]
+    ss.ph_ip = p["ip"]
+    ss.ph_otp = OTP_MODES[p["otp"]]
+    ss.ph_chan = prof["chan"] if prof["chan"] in CHANNELS else "MOBILE_BANKING"
+    ss.ph_amt = int(round(prof["avg"] * p["mult"] / 1000) * 1000)
+    ms = hub["merch"]
+    pool = ms[ms.merchant_category.isin(p["cat"]) & (ms.merchant_risk_level == p["mrisk"])]
+    if not len(pool):
+        pool = ms[ms.merchant_risk_level == p["mrisk"]]
+    ss.ph_cat = p["cat"]
+    ss.ph_mer = pool.merchant_id.iloc[0]
+    ss.ph_screen = "pay"
+
+
+def _ph_submit(hub):
+    ss = st.session_state
+    ss.ph_dev = ss.get("ph_dev") or DEVICES[0]
+    ss.ph_otp = ss.get("ph_otp") or OTP_MODES[0]
+    cid = ss.ph_cust
+    prof = cust_profile(hub, cid)
+    with hub["lock"]:
+        if ss.ph_dev == DEVICES[0]:
+            dev = prof["dev"]
+        else:
+            dev = ss.get("ph_newdev")
+            if not dev or not dev.startswith("DEV-ROOT" if ss.ph_dev == DEVICES[2] else "DEV-LA"):
+                rooted = ss.ph_dev == DEVICES[2]
+                dev = f"{'DEV-ROOT' if rooted else 'DEV-LA'}-{hub['seq'] + 1:04d}"
+                hub["sc"].dev[dev] = {"first_seen_date": hub["clock"].normalize(), "registered_customer_id": None,
+                                      "device_risk_level": "HIGH" if rooted else "MEDIUM",
+                                      "rooted_or_jailbroken": rooted, "emulator_flag": False}
+                ss.ph_newdev = dev
+        statuses = ["FAILED", "FAILED", "SUCCESS"] if ss.ph_otp == OTP_MODES[1] else ["SUCCESS"]
+        ids = []
+        for k, sts in enumerate(statuses):
+            t0 = hub["clock"] + pd.Timedelta(seconds=20 if k else 15)
+            hub["clock"] = t0
+            t = {"transaction_id": f"LIVE-{hub['seq'] + 1:04d}", "customer_id": cid, "merchant_id": ss.ph_mer,
+                 "datetime": t0, "amount": float(ss.ph_amt), "currency": "VND", "payment_channel": ss.ph_chan,
+                 "device_id": dev, "location": ss.ph_loc, "transaction_status": sts, "ip_country": ss.ph_ip,
+                 "is_card_present": False, "authentication_method": "BIOMETRIC" if ss.ph_dev == DEVICES[0] else "OTP"}
+            ev = _push(hub, t, "Điện thoại khách")
+            ev["note"] = ss.get("ph_note", "")
+            ids.append(ev["id"])
+    ss.ph_mine = (ss.get("ph_mine", []) + ids)[-30:]
+    ss.ph_last = ids[-1]
+    lvl = hub["by_id"][ids[-1]]["level"]
+    ss.ph_screen = "otp" if lvl == "MEDIUM" else "result"
+
+
+def _ph_otp(hub, ev_id, ok):
+    with hub["lock"]:
+        ev = hub["by_id"].get(ev_id)
+        if ev and ev["status"].startswith("Chờ khách"):
+            ev["status"] = "Thành công sau xác thực OTP" if ok else "Khách báo không phải mình · đã huỷ"
+    st.session_state.ph_screen = "result"
+
+
+def _ph_report(hub, ev_id):
+    with hub["lock"]:
+        ev = hub["by_id"].get(ev_id)
+        if ev and (ev["status"].startswith("Tạm giữ") or ev["status"].startswith("Chờ khách")):
+            ev["status"] = "Khách báo không phải mình · đã huỷ"
+
+
+def _status_bar(blue=False):
+    H(f'<div class="fs ph-full ph-sb {"ph-blue" if blue else ""}"><span>{datetime.now(VN_TZ):%H:%M}</span>'
+      '<span>●●● ᯤ ▮</span></div>')
+
+
+def ph_home(hub, prof):
+    ss = st.session_state
+    mine = [hub["by_id"][i] for i in ss.ph_mine if i in hub["by_id"]]
+    spent = sum(x["amount"] for x in mine if x["status"].startswith("Thành công") or x["status"].startswith("Đã xác thực"))
+    _status_bar(True)
+    H(f'<div class="fs ph-full ph-blue ph-hero"><div class="row"><div><div class="hi">Xin chào,</div>'
+      f'<div class="nm">Khách hàng {e(ss.ph_cust)}</div></div><div class="bell">🔔</div></div></div>'
+      f'<div class="fs ph-full"><div class="ph-bal"><div class="l">Tài khoản thanh toán</div>'
+      f'<div class="v">{money(25_430_000 - spent)}</div><div class="a"><span>STK {e(ss.ph_cust[-4:])} 2026 01</span>'
+      f'<b>Ẩn số dư</b></div></div></div>')
+    for row in (QUICK[:4], QUICK[4:]):
+        cols = st.columns(4, gap="small")
+        for c, (ic, lab, cat) in zip(cols, row):
+            c.button(f"{ic}  \n{lab}", key=f"qa_{lab}", width="stretch", on_click=_ph_go, args=("pay", cat, hub))
+    rows = []
+    for x in mine[::-1][:2]:
+        ok = x["status"].startswith("Thành công") or x["status"].startswith("Đã xác thực")
+        rows.append((CAT_ICON.get(x["cat"], "🧾"), x["merchant"], f'{CAT_VN.get(x["cat"], "")} · {x["dt"]:%H:%M}',
+                     f'{"−" if ok else ""}{money(x["amount"])}', "#0F172A" if ok else "#E8590C",
+                     "" if ok else x["status"].split(" · ")[0]))
+    h = prof["hist"].tail(4).iloc[::-1]
+    mm = hub["sc"].merch
+    for t in h.itertuples():
+        if len(rows) >= 3:
+            break
+        cat = mm.get(t.merchant_id, {}).get("merchant_category", "")
+        rows.append((CAT_ICON.get(cat, "🧾"), t.merchant_id, f"{CAT_VN.get(cat, '')} · {pd.Timestamp(t.datetime):%d/%m}",
+                     f"−{money(t.amount)}", "#0F172A", ""))
+    H('<div class="fs"><div class="ph-sec">Giao dịch gần đây <span>Xem tất cả</span></div>' + "".join(
+        f'<div class="ph-tx"><i>{ic}</i><div class="m"><b>{e(m)}</b><small>{e(sub)}'
+        f'{" · " + e(st_) if st_ else ""}</small></div><div class="x" style="color:{col}">{a}</div></div>'
+        for ic, m, sub, a, col, st_ in rows) + "</div>")
+    H('<div class="fs ph-full ph-nav"><div class="on"><b>⌂</b>Trang chủ</div><div><b>☰</b>Lịch sử</div>'
+      '<div><div class="qr">⌗</div></div><div><b>🔔</b>Thông báo</div><div><b>☺</b>Cá nhân</div></div>')
+
+
+def ph_pay(hub, prof):
+    ss = st.session_state
+    _status_bar()
+    c = st.columns([1, 3.2], vertical_alignment="center")
+    c[0].button("‹", key="ph_back", on_click=_ph_go, args=("home",))
+    c[1].markdown('<div class="fs ph-hdr">Thanh toán</div>', unsafe_allow_html=True)
+    ms = hub["merch"]
+    pool = ms if not ss.ph_cat else ms[ms.merchant_category.isin(ss.ph_cat)]
+    if ss.ph_mer not in set(pool.merchant_id):
+        pool = ms
+    info = ms.set_index("merchant_id")
+    st.selectbox("Thanh toán cho", pool.merchant_id.tolist(), key="ph_mer",
+                 format_func=lambda m: f"{CAT_ICON.get(info.merchant_category.get(m), '🧾')} {m} · "
+                                       f"{CAT_VN.get(info.merchant_category.get(m), '')}")
+    st.markdown(f'<div class="fs" style="font-size:12px;color:#64748B">Từ tài khoản STK {e(ss.ph_cust[-4:])} 2026 01</div>',
+                unsafe_allow_html=True)
+    st.number_input("Số tiền (VND)", min_value=10000, step=50000, key="ph_amt", format="%d")
+    cols = st.columns(4, gap="small")
+    for cc, v in zip(cols, [500_000, 1_000_000, 2_000_000, 5_000_000]):
+        cc.button(f"{v // 1000:,}k".replace(",", "."), key=f"chip_{v}", width="stretch",
+                  on_click=lambda v=v: st.session_state.update(ph_amt=v))
+    st.text_input("Nội dung", key="ph_note", placeholder="VD: thanh toán đơn hàng")
+    st.button("Tiếp tục", type="primary", width="stretch", key="ph_pay", on_click=_ph_submit, args=(hub,))
+
+
+def ph_otp(hub):
+    ev = hub["by_id"].get(st.session_state.get("ph_last"))
+    _status_bar()
+    st.markdown('<div class="fs ph-hdr">Xác nhận giao dịch</div>', unsafe_allow_html=True)
+    if not ev:
+        st.button("Về trang chủ", on_click=_ph_go, args=("home",), key="ph_home0")
+        return
+    H(f'<div class="fs ph-card"><div class="r"><span>Người nhận</span><b>{e(ev["merchant"])}</b></div>'
+      f'<div class="r"><span>Số tiền</span><b>{money(ev["amount"])}</b></div><div class="r"><span>Phí</span><b>Miễn phí</b></div></div>'
+      '<div class="fs ph-warn">🔐 Giao dịch có dấu hiệu khác thói quen của bạn. Vui lòng nhập mã OTP vừa gửi tới số điện '
+      'thoại đăng ký.</div><div class="fs ph-otp"><b>4</b><b>8</b><b>2</b><b>9</b><b>1</b><b>6</b></div>')
+    st.button("Xác nhận", type="primary", width="stretch", key="ph_otp_ok", on_click=_ph_otp, args=(hub, ev["id"], True))
+    st.button("Không phải tôi thực hiện", width="stretch", key="ph_otp_no", on_click=_ph_otp, args=(hub, ev["id"], False))
+
+
+def ph_result(hub):
+    ev = hub["by_id"].get(st.session_state.get("ph_last"))
+    if not ev:
+        return
+    s = ev["status"]
+    if s.startswith("Thành công") or s.startswith("Đã xác thực"):
+        bg, ic, t, p, col = "#E6F4EA", "✅", "Thanh toán thành công", "Cảm ơn bạn đã sử dụng FS Pay", "#2F9E44"
+    elif s.startswith("Tạm giữ"):
+        bg, ic, t, col = "#FFF4E6", "⏳", "Giao dịch đang được kiểm tra", "#E8590C"
+        p = ("Để bảo vệ tài khoản, ngân hàng đang xác minh giao dịch này. Tiền chưa bị trừ. Bạn có thể nhận cuộc gọi "
+             "xác minh trong ít phút.")
+    elif s.startswith("Chờ khách"):
+        bg, ic, t, p, col = "#FFF8E1", "🔐", "Cần xác thực thêm", "Vui lòng xác thực để hoàn tất giao dịch.", "#A06A00"
+    else:
+        bg, ic, t, col = "#FFE3E3", "⛔", "Giao dịch không thành công", "#C92A2A"
+        p = ("Ngân hàng đã từ chối giao dịch để bảo vệ tài khoản của bạn. Nếu đây đúng là bạn, vui lòng liên hệ tổng đài "
+             "hỗ trợ." if "chặn" in s.lower() or "huỷ" in s.lower() else s)
+    H(f'<div class="fs ph-res"><div class="ic" style="background:{bg}">{ic}</div><h3>{t}</h3><p>{e(p)}</p></div>'
+      f'<div class="fs ph-card"><div class="r"><span>Số tiền</span><b>{money(ev["amount"])}</b></div>'
+      f'<div class="r"><span>Người nhận</span><b>{e(ev["merchant"])}</b></div>'
+      f'<div class="r"><span>Mã giao dịch</span><b>{e(ev["tid"])}</b></div>'
+      f'<div class="r"><span>Trạng thái</span><b style="color:{col}">{e(s)}</b></div></div>')
+    if s.startswith("Tạm giữ"):
+        st.button("Tôi không thực hiện giao dịch này", width="stretch", key=f"ph_rep_{ev['id']}",
+                  on_click=_ph_report, args=(hub, ev["id"]))
+    else:
+        if st.button("Về trang chủ", type="primary", width="stretch", key=f"ph_home_{ev['id']}"):
+            st.session_state.ph_screen = "home"
+            st.rerun()
+
+
+def control_panel(hub, custs, prof):
+    ss = st.session_state
+    with st.container(key="fspanel"):
+        H('<div class="fs pn-h">🎛️ Bảng điều khiển giả lập <em>CHỈ DÙNG KHI DEMO</em></div>'
+          '<div class="fs pn-sub">Đặt hoàn cảnh của giao dịch tiếp theo. Khách không nhìn thấy bảng này – đây là những thông '
+          'tin ngân hàng thu được ngầm từ thiết bị và mạng.</div>')
+        H('<div class="fs pn-g">Khách hàng đăng nhập</div>')
+        st.selectbox("Khách hàng", custs, key="ph_cust", label_visibility="collapsed", on_change=_ph_reset_cust,
+                     format_func=lambda c: f"{c} · {PROV_VN.get(cust_profile(hub, c)['home'], '')} · chi thường "
+                                           f"~{money(cust_profile(hub, c)['avg'])}")
+        H('<div class="fs pn-g">Thiết bị</div>')
+        st.segmented_control("Thiết bị", DEVICES, key="ph_dev", label_visibility="collapsed",
+                             format_func=lambda x: x if x != DEVICES[0] else f"{x} ({prof['dev']})")
+        c = st.columns(2)
+        with c[0]:
+            H('<div class="fs pn-g">Vị trí giao dịch</div>')
+            st.selectbox("Vị trí", list(PROV_VN), key="ph_loc", label_visibility="collapsed",
+                         format_func=lambda x: f"📍 {PROV_VN[x]}{' (nơi ở)' if x == prof['home'] else ''}")
+        with c[1]:
+            H('<div class="fs pn-g">Mạng / IP</div>')
+            st.selectbox("IP", list(IP_VN), key="ph_ip", label_visibility="collapsed", format_func=lambda x: f"🌐 {IP_VN[x]}")
+        c = st.columns(2)
+        with c[0]:
+            H('<div class="fs pn-g">Kênh thanh toán</div>')
+            st.selectbox("Kênh", list(CHANNELS), key="ph_chan", label_visibility="collapsed",
+                         format_func=lambda x: f"{CHANNELS[x]}{' (quen dùng)' if x == prof['chan'] else ''}")
+        with c[1]:
+            H('<div class="fs pn-g">Khi được hỏi OTP</div>')
+            st.segmented_control("OTP", OTP_MODES, key="ph_otp", label_visibility="collapsed")
+        H('<div class="fs pn-g">Kịch bản nhanh (bấm là điền sẵn cả app lẫn bảng này)</div>')
+        names = list(PRESETS)
+        for i in range(0, 4, 2):
+            cc = st.columns(2)
+            for j, col in enumerate(cc):
+                nm = names[i + j]
+                col.button(f"**{nm}**  \n{PRESETS[nm]['desc']}", key=f"sc_{i + j}", width="stretch",
+                           on_click=_ph_preset, args=(nm, hub))
+        H('<div class="fs pn-g">Giao dịch vừa gửi → kết quả hệ thống trả về</div>')
+        mine = [hub["by_id"][i] for i in ss.ph_mine if i in hub["by_id"]][::-1][:5]
+        if mine:
+            H('<div class="fs pn-log">' + "".join(
+                f'<div><span>{x["dt"]:%H:%M:%S} · {e(x["tid"])} · {money(x["amount"])} · {e(x["dev"])} · IP {e(x["ip"])}'
+                f'{" · " + ("thất bại" if x["tx_status"] != "SUCCESS" else "") if x["tx_status"] != "SUCCESS" else ""}</span>'
+                f'<span class="pn-bd" style="background:{LEVEL_COLOR[x["level"]]}">{x["level"]} · '
+                f'{e(x["status"].split(" · ")[0].lower())}</span></div>' for x in mine) + "</div>")
+        else:
+            st.caption("Chưa gửi giao dịch nào.")
+        st.caption("Ứng dụng thanh toán mô phỏng “FS Pay” phục vụ trình diễn Fraud Shield – không phải ứng dụng của ngân "
+                   "hàng thật. Mô hình chấm điểm không dùng giờ trong ngày nên bảng không có mục thời điểm.")
+
+
+def phone_screen(hub, prof):
+    sc = st.session_state.ph_screen
+    if sc == "pay":
+        ph_pay(hub, prof)
+    elif sc == "otp":
+        ph_otp(hub)
+    elif sc == "result":
+        _status_bar()
+        ev = hub["by_id"].get(st.session_state.get("ph_last"))
+        waiting = ev is not None and ev["status"].startswith("Tạm giữ")
+        st.fragment(ph_result, run_every=1.0 if waiting else None)(hub)
+    else:
+        ph_home(hub, prof)
+
+
 def page_customer(res):
-    """Giao diện riêng cho điện thoại khách: mở link ?view=khach."""
-    H(re.sub(r"\s*\n\s*", " ", LIVE_CSS))
-    H('<style>section[data-testid="stSidebar"],header[data-testid="stHeader"],[data-testid="stToolbar"],'
-      '[data-testid="collapsedControl"],[data-testid="stSidebarCollapsedControl"]{display:none!important}'
-      '.block-container,[data-testid="stMainBlockContainer"]{max-width:440px!important;padding-top:1rem!important}'
-      '.stApp{background:linear-gradient(160deg,#E8EEFC 0%,#F3F6FB 60%)!important}</style>')
-    phone_app(res, standalone=True)
-    st.caption("Ứng dụng thanh toán mô phỏng phục vụ trình diễn Fraud Shield – không phải ứng dụng của ngân hàng thật.")
+    """Ứng dụng khách FS Pay – trang riêng, mở bằng link ?view=khach (tab khác hoặc điện thoại thật)."""
+    H(re.sub(r"\s*\n\s*", " ", PHONE_CSS))
+    hub = hub_get(res)
+    custs = demo_customers(hub["hist"], res["ds"])
+    if not custs:
+        st.caption("Không có khách hàng mẫu.")
+        return
+    prof = _ph_defaults(hub, custs)
+    left, right = st.columns([1, 1.35], gap="large")
+    with left:
+        with st.container(key="fsphone"):
+            phone_screen(hub, prof)
+    with right:
+        control_panel(hub, custs, prof)
 
 
 # ============================================================================= 5. DỮ LIỆU & CHẠY MÔ HÌNH
